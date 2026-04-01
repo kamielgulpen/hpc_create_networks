@@ -21,11 +21,8 @@
 # --- Environment setup -------------------------------------------------------
 # Adjust the lines below to match your cluster's module system and venv path.
 
-# module load python/3.11          # uncomment and set Python version if needed
-# source /path/to/your/venv/bin/activate   # uncomment and set your venv path
-
-# Alternatively, if using uv:
-# source .venv/bin/activate
+module load python/3.11          # adjust version if needed
+source .venv/bin/activate
 
 # -----------------------------------------------------------------------------
 
