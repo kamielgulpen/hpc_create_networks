@@ -2,7 +2,7 @@
 # =============================================================================
 # SLURM Array Job: Enriched Network Generation
 #
-# Parameter space: 10 pref_attachment × 10 n_communities = 100 combinations
+# Parameter space: 10 pref_attachment x 10 n_communities = 100 combinations
 # Each array task generates all enriched pairs from Data/enriched/aggregated/
 # for one (pref_attachment, n_communities) combination.
 #
