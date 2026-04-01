@@ -45,6 +45,7 @@ Thumbs.db
 *.log
 *.csv
 *.parquet
+*.json
 
 my_networks
 Data
