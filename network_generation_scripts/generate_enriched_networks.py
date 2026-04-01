@@ -66,9 +66,8 @@ for preferential_attachment in np.linspace(0, 0.99, 10):
         params = (f"scale={scale}_comms={number_of_communities}"
                   f"_recip={reciprocity_p}_trans={transitivity_p}"
                   f"_pa={preferential_attachment:.2f}_bridge={bridge_probability}")
-        count = 0
+
         for label, pops, links in all_pairs:
-            count += 1
             print(f"\n{'='*60}")
             print(f"PA={preferential_attachment:.2f}  comms={number_of_communities}  [{label}]")
             print(f"{'='*60}")
@@ -115,8 +114,6 @@ for preferential_attachment in np.linspace(0, 0.99, 10):
                   f"Q1: {np.quantile(degrees, 0.25):.0f}, Q3: {np.quantile(degrees, 0.75):.0f}, "
                   f"skew: {stats.skew(degrees):.2f}")
 
-            # Save: Data/networks/<label>/<params>/<combo>.pkl
-            # label is e.g. "werkschool/etngrp_lft" or "enriched/etngrp_geslacht_lft_oplniv"
             combo_name = Path(label).name
             output_dir = Path('Data/networks') / Path(label).parent / params
             output_dir.mkdir(parents=True, exist_ok=True)

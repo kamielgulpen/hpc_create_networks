@@ -43,7 +43,8 @@ Thumbs.db
 
 # Logs & data
 *.log
-# *.csv
+*.csv
 *.parquet
 
 my_networks
+Data
