@@ -30,7 +30,7 @@ from asnu import generate, create_communities
 # Parameter space (must match generate_enriched_networks.py)
 # =============================================================================
 
-ENRICHED_AGG_DIR  = Path('Data/enriched/aggregated')
+ENRICHED_AGG_DIR  = Path('Data/Data/enriched/aggregated')
 SCALE             = 1
 RECIPROCITY_P     = 1
 TRANSITIVITY_P    = 0
