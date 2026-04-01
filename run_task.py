@@ -136,9 +136,9 @@ def generate_one(pref_att, n_comms, label, pops, links, params):
           f"skew: {stats.skew(degrees):.2f}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_file, 'wb') as f:
-        pickle.dump(graph, f)
-    print(f"Saved to {out_file}")
+    # with open(out_file, 'wb') as f:
+    #     pickle.dump(graph, f)
+    # print(f"Saved to {out_file}")
 
     dist_dir = output_dir / 'node_distribution'
     dist_dir.mkdir(exist_ok=True)
