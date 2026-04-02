@@ -6,47 +6,67 @@
 #SBATCH --output=logs/main_%j.out
 #SBATCH --error=logs/main_%j.err
 
-set -e
+# Remove set -e temporarily to see all errors
+# set -e
 
-# Use SLURM's submission directory (where you ran sbatch from)
-cd "${SLURM_SUBMIT_DIR}"
+echo "=== Script Started ==="
+echo "Current dir: $(pwd)"
+echo "SLURM_SUBMIT_DIR: ${SLURM_SUBMIT_DIR}"
 
-echo "Working directory: $(pwd)"
-echo "Starting all tasks on $(hostname) at $(date)"
-echo "Using ${SLURM_CPUS_PER_TASK} CPUs"
+# Try to cd
+if [ -n "${SLURM_SUBMIT_DIR}" ]; then
+    echo "Changing to SLURM_SUBMIT_DIR..."
+    cd "${SLURM_SUBMIT_DIR}" || { echo "ERROR: cd failed"; exit 1; }
+    echo "Success! Now in: $(pwd)"
+else
+    echo "WARNING: SLURM_SUBMIT_DIR not set, staying in $(pwd)"
+fi
 
-# Activate environment
-source .venv/bin/activate
+echo "Listing directory:"
+ls -la
 
-# Logs directory already exists (SLURM created it for main output)
-mkdir -p logs
+# Check if venv exists
+if [ -f ".venv/bin/activate" ]; then
+    echo "Found venv, activating..."
+    source .venv/bin/activate || { echo "ERROR: venv activation failed"; exit 1; }
+    echo "Activated! Python: $(which python)"
+else
+    echo "ERROR: .venv/bin/activate not found"
+    echo "Looking for venv:"
+    find . -name "activate" -type f 2>/dev/null
+    exit 1
+fi
 
-# Function to limit concurrent jobs
+# Check if run_task.py exists
+if [ -f "run_task.py" ]; then
+    echo "Found run_task.py"
+else
+    echo "ERROR: run_task.py not found"
+    exit 1
+fi
+
+echo "All checks passed, starting tasks..."
+
+# Rest of the script...
 max_parallel=40
 running=0
 
 for task_id in {0..99}; do
-    # Run task in background
     python run_task.py --task_id ${task_id} \
         > logs/task_${task_id}.out \
         2> logs/task_${task_id}.err &
     
     ((running++))
     
-    echo "Started task ${task_id} (${running} running)"
+    if (( task_id % 10 == 0 )); then
+        echo "Started task ${task_id}"
+    fi
     
-    # When we hit the limit, wait for one to finish
     if (( running >= max_parallel )); then
         wait -n
         ((running--))
     fi
 done
 
-# Wait for all remaining tasks
 wait
-
-echo "All 100 tasks completed at $(date)"
-
-# Summary
-successful=$(ls logs/task_*.out 2>/dev/null | wc -l)
-echo "Completed: ${successful}/100 tasks"
+echo "All tasks completed"
