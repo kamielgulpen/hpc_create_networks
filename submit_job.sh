@@ -20,7 +20,7 @@ echo "Using ${SLURM_CPUS_PER_TASK} CPUs"
 # source .venv/bin/activate
 
 # Create logs directory
-mkdir -p logs
+# mkdir -p logs
 
 # Function to limit concurrent jobs
 max_parallel=33
