@@ -1,35 +1,53 @@
 #!/bin/bash
-# =============================================================================
-# SLURM Array Job: Enriched Network Generation
-#
-# Parameter space: 10 pref_attachment x 10 n_communities = 100 combinations
-# Each array task generates all enriched pairs from Data/enriched/aggregated/
-# for one (pref_attachment, n_communities) combination.
-#
-# Workflow:
-#   1. sbatch submit_job.sh
-# =============================================================================
-
 #SBATCH --job-name=create_networks
-#SBATCH --array=0-99               # 100 tasks (0-indexed), one per parameter combo
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --time=04:00:00            # adjust per your cluster limits
-#SBATCH --output=logs/create_%A_%a.out
-#SBATCH --error=logs/create_%A_%a.err
+#SBATCH --cpus-per-task=40       # Use all 40 CPUs on the node
+#SBATCH --time=04:00:00
+#SBATCH --output=logs/main_%j.out
+#SBATCH --error=logs/main_%j.err
 
-# --- Environment setup -------------------------------------------------------
-# Adjust the lines below to match your cluster's module system and venv path.
+set -e
 
-# module load python/3.11          # adjust version if needed
-# source .venv/bin/activate
+# Get to the right directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
 
-# -----------------------------------------------------------------------------
+echo "Working directory: $(pwd)"
+echo "Starting all tasks on $(hostname) at $(date)"
+echo "Using ${SLURM_CPUS_PER_TASK} CPUs"
 
+# Activate environment
+source .venv/bin/activate
+
+# Create logs directory
 mkdir -p logs
 
-echo "Starting task ${SLURM_ARRAY_TASK_ID} on $(hostname) at $(date)"
+# Function to limit concurrent jobs
+max_parallel=33
+running=0
 
-python run_task.py --task_id "${SLURM_ARRAY_TASK_ID}"
+for task_id in {0..99}; do
+    # Run task in background
+    python run_task.py --task_id ${task_id} \
+        > logs/task_${task_id}.out \
+        2> logs/task_${task_id}.err &
+    
+    ((running++))
+    
+    echo "Started task ${task_id} (${running} running)"
+    
+    # When we hit the limit, wait for one to finish
+    if (( running >= max_parallel )); then
+        wait -n  # Wait for next job to finish
+        ((running--))
+    fi
+done
 
-echo "Finished task ${SLURM_ARRAY_TASK_ID} at $(date)"
+# Wait for all remaining tasks
+wait
+
+echo "All 100 tasks completed at $(date)"
+
+# Summary
+successful=$(grep -L "error\|Error\|ERROR" logs/task_*.err 2>/dev/null | wc -l)
+echo "Successfully completed: ${successful}/100 tasks"

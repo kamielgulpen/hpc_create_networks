@@ -35,7 +35,7 @@ def nx_to_igraph(nx_graph):
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-ENRICHED_AGG_DIR = Path('Data/enriched/aggregated')
+ENRICHED_AGG_DIR = Path('Data/Data/enriched/aggregated')
 
 BASE_LAYERS          = ["werkschool", "huishouden", "familie", "buren"]
 BASE_CHARACTERISTICS = sorted(["geslacht", "lft", "etngrp", "oplniv"])
@@ -61,7 +61,7 @@ all_pairs = enriched_pairs
 # ── Main loop ─────────────────────────────────────────────────────────────────
 for preferential_attachment in np.linspace(0, 0.99, 10):
     for number_of_communities in np.linspace(1, 100, 10):
-        number_of_communities = int(number_of_communities)
+        number_of_communities = 12
 
         params = (f"scale={scale}_comms={number_of_communities}"
                   f"_recip={reciprocity_p}_trans={transitivity_p}"
@@ -81,6 +81,7 @@ for preferential_attachment in np.linspace(0, 0.99, 10):
                 number_of_communities = number_of_communities,
                 output_path='my_communities.json',
                 mode= "capacity",
+                allow_new_communities= False
 
             )
 

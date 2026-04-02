@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/home/kamiel/practice/hpc_create_networks/run_task.py", line 20, in <module>
+    import igraph as ig
+ModuleNotFoundError: No module named 'igraph'
