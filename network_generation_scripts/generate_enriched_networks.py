@@ -35,7 +35,7 @@ def nx_to_igraph(nx_graph):
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-ENRICHED_AGG_DIR = Path('Data/enriched/aggregated')
+ENRICHED_AGG_DIR = Path('Data/Data/enriched/aggregated')
 
 BASE_LAYERS          = ["werkschool", "huishouden", "familie", "buren"]
 BASE_CHARACTERISTICS = sorted(["geslacht", "lft", "etngrp", "oplniv"])
