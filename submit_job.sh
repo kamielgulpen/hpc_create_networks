@@ -48,7 +48,7 @@ fi
 echo "All checks passed, starting tasks..."
 
 # Rest of the script...
-max_parallel=40
+max_parallel=15
 running=0
 
 for task_id in {0..99}; do
