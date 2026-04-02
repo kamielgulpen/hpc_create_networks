@@ -10,8 +10,9 @@ Usage:
 """
 
 import argparse
+import json
 import os
-import pickle
+import tempfile
 import time
 from itertools import product
 from pathlib import Path
@@ -86,10 +87,10 @@ def generate_one(pref_att, n_comms, label, pops, links, params):
     """Generate and save one enriched network."""
     combo_name = Path(label).name
     output_dir = Path('Data/networks') / Path(label).parent / params
-    out_file   = output_dir / f'{combo_name}.pkl'
+    stats_file = output_dir / f'{combo_name}_stats.json'
 
-    if out_file.exists():
-        print(f"  Already exists: {out_file}. Skipping.")
+    if stats_file.exists():
+        print(f"  Already exists: {stats_file}. Skipping.")
         return
 
     print(f"\n{'='*60}")
@@ -98,28 +99,34 @@ def generate_one(pref_att, n_comms, label, pops, links, params):
 
     start = time.perf_counter()
 
-    create_communities(
-        pops,
-        links,
-        scale=SCALE,
-        number_of_communities=n_comms,
-        output_path='my_communities.json',
-        mode='capacity',
-    )
+    with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as tmp:
+        communities_path = tmp.name
 
-    graph = generate(
-        pops,
-        links,
-        preferential_attachment=pref_att,
-        scale=SCALE,
-        reciprocity=RECIPROCITY_P,
-        transitivity=TRANSITIVITY_P,
-        community_file='my_communities.json',
-        base_path=f'my_networks/{params}/{label}',
-        bridge_probability=BRIDGE_PROBABILITY,
-        fully_connect_communities=False,
-        fill_unfulfilled=True,
-    )
+    try:
+        create_communities(
+            pops,
+            links,
+            scale=SCALE,
+            number_of_communities=n_comms,
+            output_path=communities_path,
+            mode='capacity',
+        )
+
+        graph = generate(
+            pops,
+            links,
+            preferential_attachment=pref_att,
+            scale=SCALE,
+            reciprocity=RECIPROCITY_P,
+            transitivity=TRANSITIVITY_P,
+            community_file=communities_path,
+            base_path=f'my_networks/{params}/{label}',
+            bridge_probability=BRIDGE_PROBABILITY,
+            fully_connect_communities=False,
+            fill_unfulfilled=True,
+        )
+    finally:
+        os.unlink(communities_path)
 
     elapsed = time.perf_counter() - start
     print(f"Generation time: {elapsed:.2f}s")
@@ -127,18 +134,47 @@ def generate_one(pref_att, n_comms, label, pops, links, params):
     G_nx = graph.graph
     G_ig = nx_to_igraph(G_nx)
     degrees = G_ig.degree(mode="in")
-    print(f"Nodes: {G_ig.vcount()}, Edges: {G_ig.ecount()}")
-    print(f"Reciprocity:   {G_ig.reciprocity():.4f}")
-    print(f"Transitivity:  {G_ig.transitivity_undirected():.4f}")
-    print(f"Degree — mean: {np.mean(degrees):.1f}, std: {np.std(degrees):.1f}, "
-          f"median: {np.median(degrees):.0f}, min: {min(degrees)}, max: {max(degrees)}, "
-          f"Q1: {np.quantile(degrees, 0.25):.0f}, Q3: {np.quantile(degrees, 0.75):.0f}, "
-          f"skew: {stats.skew(degrees):.2f}")
+
+    community_membership = G_ig.vs['community'] if 'community' in G_ig.vs.attributes() else None
+    if community_membership is not None:
+        modularity = G_ig.modularity(community_membership)
+    else:
+        modularity = None
+
+    net_stats = {
+        'label':             label,
+        'pref_attachment':   round(pref_att, 4),
+        'n_communities':     int(n_comms),
+        'params':            params,
+        'generation_time_s': round(elapsed, 2),
+        'nodes':             G_ig.vcount(),
+        'edges':             G_ig.ecount(),
+        'reciprocity':       round(G_ig.reciprocity(), 4),
+        'transitivity':      round(G_ig.transitivity_undirected(), 4),
+        'modularity':        round(modularity, 4) if modularity is not None else None,
+        'degree_mean':       round(float(np.mean(degrees)), 2),
+        'degree_std':        round(float(np.std(degrees)), 2),
+        'degree_median':     round(float(np.median(degrees)), 1),
+        'degree_min':        int(min(degrees)),
+        'degree_max':        int(max(degrees)),
+        'degree_q1':         round(float(np.quantile(degrees, 0.25)), 1),
+        'degree_q3':         round(float(np.quantile(degrees, 0.75)), 1),
+        'degree_skew':       round(float(stats.skew(degrees)), 4),
+    }
+
+    print(f"Nodes: {net_stats['nodes']}, Edges: {net_stats['edges']}")
+    print(f"Reciprocity:   {net_stats['reciprocity']:.4f}")
+    print(f"Transitivity:  {net_stats['transitivity']:.4f}")
+    print(f"Modularity:    {net_stats['modularity']}")
+    print(f"Degree — mean: {net_stats['degree_mean']}, std: {net_stats['degree_std']}, "
+          f"median: {net_stats['degree_median']}, min: {net_stats['degree_min']}, "
+          f"max: {net_stats['degree_max']}, Q1: {net_stats['degree_q1']}, "
+          f"Q3: {net_stats['degree_q3']}, skew: {net_stats['degree_skew']}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    # with open(out_file, 'wb') as f:
-    #     pickle.dump(graph, f)
-    # print(f"Saved to {out_file}")
+    with open(stats_file, 'w') as f:
+        json.dump(net_stats, f, indent=2)
+    print(f"Stats saved to {stats_file}")
 
     dist_dir = output_dir / 'node_distribution'
     dist_dir.mkdir(exist_ok=True)
