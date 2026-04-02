@@ -17,7 +17,7 @@ echo "Starting all tasks on $(hostname) at $(date)"
 echo "Using ${SLURM_CPUS_PER_TASK} CPUs"
 
 # Activate environment
-source .venv/bin/activate
+# source .venv/bin/activate
 
 # Create logs directory
 mkdir -p logs
