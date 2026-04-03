@@ -3,7 +3,7 @@
 cd "$(dirname "$0")"
 source .venv/bin/activate
 
-max_parallel=10
+max_parallel=5
 running=0
 mkdir -p logs
 
