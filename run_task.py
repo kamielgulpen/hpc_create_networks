@@ -38,7 +38,7 @@ TRANSITIVITY_P    = 0
 BRIDGE_PROBABILITY = 0.2
 
 PREF_ATTACHMENT_VALUES = np.linspace(0, 0.99, 10)
-N_COMMUNITIES_VALUES   = np.linspace(1, 100, 10).astype(int)
+N_COMMUNITIES_VALUES   = np.linspace(1, 200, 20).astype(int)
 
 
 def all_combinations():
@@ -110,6 +110,7 @@ def generate_one(pref_att, n_comms, label, pops, links, params):
             number_of_communities=n_comms,
             output_path=communities_path,
             mode='capacity',
+            allow_new_communities=False
         )
 
         graph = generate(
