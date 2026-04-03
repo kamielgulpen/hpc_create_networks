@@ -60,9 +60,9 @@ all_pairs = enriched_pairs
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 for preferential_attachment in np.linspace(0, 0.99, 10):
-    for number_of_communities in np.linspace(1, 100, 10):
+    for number_of_communities in np.linspace(1, 200, 20):
         number_of_communities = int(number_of_communities)
-
+        
         params = (f"scale={scale}_comms={number_of_communities}"
                   f"_recip={reciprocity_p}_trans={transitivity_p}"
                   f"_pa={preferential_attachment:.2f}_bridge={bridge_probability}")
