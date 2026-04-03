@@ -1,0 +1,32 @@
+Script started
+/home/kamiel/practice/hpc_create_networks
+SLURM_SUBMIT_DIR: /home/kamiel/practice/hpc_create_networks
+Changed to: /home/kamiel/practice/hpc_create_networks
+total 832
+drwxr-xr-x. 11 kamiel kamiel   4096 Apr  2 14:23 .
+drwxr-xr-x.  6 kamiel kamiel     88 Apr  1 18:55 ..
+drwxr-xr-x.  5 kamiel kamiel     69 Apr  1 13:59 asnu
+drwxr-xr-x.  4 kamiel kamiel     46 Apr  2 10:11 Data
+drwxr-xr-x.  8 kamiel kamiel   4096 Apr  2 14:19 .git
+-rw-r--r--.  1 kamiel kamiel     17 Apr  1 13:25 .gitattributes
+-rw-r--r--.  1 kamiel kamiel    424 Apr  2 14:04 .gitignore
+drwxr-xr-x.  2 kamiel kamiel      6 Apr  1 14:09 graph_data
+-rw-r--r--.  1 kamiel kamiel  18093 Apr  1 22:33 launch.log
+-rwxr-xr-x.  1 kamiel kamiel    904 Apr  1 20:49 launch_tasks.sh
+drwxr-xr-x.  2 kamiel kamiel  16384 Apr  2 14:20 logs
+drwxr-xr-x.  4 kamiel kamiel    135 Apr  2 11:33 my_networks
+drwxr-xr-x.  2 kamiel kamiel     43 Apr  2 14:09 network_generation_scripts
+-rw-r--r--.  1 kamiel kamiel   1312 Apr  1 11:53 pyproject.toml
+drwxr-xr-x.  2 kamiel kamiel      6 Apr  1 13:27 results
+-rw-r--r--.  1 kamiel kamiel   8242 Apr  2 10:43 run_task.py
+-rwxr-xr-x.  1 kamiel kamiel   1200 Apr  2 14:19 submit_job.sh
+-rw-r--r--.  1 kamiel kamiel      0 Apr  2 09:51 test_640.err
+-rw-r--r--.  1 kamiel kamiel    166 Apr  2 09:51 test_640.out
+-rw-r--r--.  1 kamiel kamiel      0 Apr  2 14:23 test_875.err
+-rw-r--r--.  1 kamiel kamiel    171 Apr  2 14:23 test_875.out
+-rwxr-xr-x.  1 kamiel kamiel    281 Apr  2 09:21 test.sh
+-rw-r--r--.  1 kamiel kamiel    296 Apr  2 14:23 test_simple.sh
+-rwxr-xr-x.  1 kamiel kamiel    122 Apr  1 18:36 test_submit.sh
+-rw-r--r--.  1 kamiel kamiel 746756 Apr  1 12:54 uv.lock
+drwxr-xr-x.  6 kamiel kamiel    132 Apr  1 13:43 .venv
+Script finished
