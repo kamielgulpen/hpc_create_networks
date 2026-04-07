@@ -3,7 +3,7 @@
 cd "$(dirname "$0")"
 source .venv/bin/activate
 
-max_parallel=5
+max_parallel=2
 running=0
 n_tasks=$(python seeding_experiments_memory.py --list_tasks)
 mkdir -p logs
@@ -11,7 +11,7 @@ mkdir -p logs
 echo "Starting ${n_tasks} tasks at $(date)"
 
 for task_id in $(seq 0 $((n_tasks - 1))); do
-    python seeding_experiments_memory.py --task_id ${task_id} \
+    PYTHONUNBUFFERED=1 python seeding_experiments_memory.py --task_id ${task_id} \
         > logs/sweep_${task_id}.out \
         2> logs/sweep_${task_id}.err &
 
