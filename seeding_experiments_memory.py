@@ -244,9 +244,11 @@ class ContagionAnalyzer:
 
             sim = ContagionSimulator(G, name)
             initial = int(len(G) * self.sim.initial_infected_fraction)
+            print(f"  Simulating {name} ({len(G)} nodes, {self.sim.n_simulations} sims)...", flush=True)
 
             finals = {}
             for i, tau in enumerate(self.sim.thresholds):
+                print(f"    threshold {i+1}/{len(self.sim.thresholds)} (tau={tau:.3f})", flush=True)
                 ts_list, inf_times = sim.complex_contagion(
                     threshold=tau,
                     threshold_type=self.sim.threshold_type,
