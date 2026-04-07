@@ -51,14 +51,14 @@ echo "All checks passed, starting tasks..."
 max_parallel=15
 running=0
 
-for task_id in {0..99}; do
+for task_id in {0..199}; do
     python run_task.py --task_id ${task_id} \
         > logs/task_${task_id}.out \
         2> logs/task_${task_id}.err &
-    
+
     ((running++))
-    
-    if (( task_id % 10 == 0 )); then
+
+    if (( task_id % 20 == 0 )); then
         echo "Started task ${task_id}"
     fi
     
