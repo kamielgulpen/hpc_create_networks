@@ -17,81 +17,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import networkx as nx
-import numba
 import numpy as np
 import pandas as pd
-
-
-# =============================================================================
-# Contagion kernel (JIT-compiled)
-# =============================================================================
-
-@numba.njit(parallel=True, cache=True)
-def _complex_contagion_kernel(data, indices, indptr, degree, state, threshold, is_fractional, max_steps):
-    """
-    JIT-compiled contagion kernel with per-node infection time tracking.
-
-    Returns:
-        time_series:     (actual_steps+1, n_sims) int64 — infected counts per step
-        infection_times: (n, n_sims) int64 — step at which each node was infected
-                         (-1 = never infected, 0 = seeded before step 1)
-    """
-    n, n_sims = state.shape
-    infected_counts = np.empty((n, n_sims), dtype=np.float64)
-    time_series = np.empty((max_steps + 1, n_sims), dtype=np.int64)
-    infection_times = np.full((n, n_sims), -1, dtype=np.int64)
-
-    # Record seeds at time 0
-    for s in range(n_sims):
-        t = np.int64(0)
-        for i in range(n):
-            if state[i, s] > 0.0:
-                t += np.int64(1)
-                infection_times[i, s] = 0
-        time_series[0, s] = t
-
-    actual_steps = 0
-
-    for step in range(max_steps):
-        for i in numba.prange(n):
-            row_start = indptr[i]
-            row_end = indptr[i + 1]
-            for s in range(n_sims):
-                val = 0.0
-                for j_ptr in range(row_start, row_end):
-                    val += data[j_ptr] * state[indices[j_ptr], s]
-                infected_counts[i, s] = val
-
-        for i in numba.prange(n):
-            d = degree[i]
-            for s in range(n_sims):
-                if state[i, s] == 0.0:
-                    ic = infected_counts[i, s]
-                    if is_fractional:
-                        meets = (d > 0.0) and (ic / d >= threshold)
-                    else:
-                        meets = ic >= threshold
-                    if meets:
-                        state[i, s] = 1.0
-                        infection_times[i, s] = step + 1
-
-        all_done = True
-        converged = 0
-        for s in range(n_sims):
-            t = np.int64(0)
-            for i in range(n):
-                t += np.int64(state[i, s] > 0.0)
-            time_series[step + 1, s] = t
-            if t != np.int64(n) and t != time_series[step, s]:
-                all_done = False
-            if t == time_series[step, s] or t == np.int64(n):
-                converged += 1
-        actual_steps += 1
-        if all_done:
-            break
-
-    print(f"converged = {converged}, out of{n_sims}, {actual_steps}")
-    return time_series[:actual_steps + 1], infection_times
 
 
 # =============================================================================
@@ -136,14 +63,42 @@ class ContagionSimulator:
         """
         state = np.zeros((self.n, n_simulations), dtype=np.float64)
         self._seed_state(state, n_simulations, seeding, initial_infected)
+
+        infection_times = np.full((self.n, n_simulations), -1, dtype=np.int64)
+        infection_times[state > 0] = 0
+
         is_fractional = (threshold_type != 'absolute')
-        ts, infection_times = _complex_contagion_kernel(
-            self.adj.data, self.adj.indices, self.adj.indptr,
-            self.degree, state, float(threshold), is_fractional, max_steps
-        )
-        time_series = [[int(ts[t, sim]) for t in range(ts.shape[0])]
-                       for sim in range(n_simulations)]
-        return time_series, infection_times
+        deg = self.degree[:, np.newaxis]  # (n, 1) for broadcasting
+
+        totals = np.sum(state, axis=0)
+        time_series = [totals.copy()]
+
+        for step in range(max_steps):
+            infected_counts = self.adj @ state  # (n, n_sims)
+            susceptible = (state == 0)
+
+            if is_fractional:
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    fraction = infected_counts / deg
+                fraction = np.where(deg == 0, 0.0, fraction)
+                meets_threshold = fraction >= threshold
+            else:
+                meets_threshold = infected_counts >= threshold
+
+            new_adopters = susceptible & meets_threshold
+            infection_times[new_adopters] = step + 1
+            state[new_adopters] = 1.0
+
+            prev_totals = totals
+            totals = np.sum(state, axis=0)
+            time_series.append(totals.copy())
+
+            if np.all(totals == self.n) or np.all(totals == prev_totals):
+                break
+
+        time_series_list = [[int(time_series[t][sim]) for t in range(len(time_series))]
+                            for sim in range(n_simulations)]
+        return time_series_list, infection_times
 
 
 # =============================================================================
