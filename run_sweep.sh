@@ -3,7 +3,7 @@
 cd "$(dirname "$0")"
 source .venv/bin/activate
 
-max_parallel=2
+max_parallel=5
 running=0
 n_tasks=$(python seeding_experiments_memory.py --list_tasks)
 mkdir -p logs
