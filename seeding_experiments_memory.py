@@ -105,14 +105,13 @@ class ContagionSimulator:
 # Network loader
 # =============================================================================
 
-def load_networks(folder) -> Dict[str, nx.Graph]:
-    """Load all graph.npz networks from subfolders of {folder}/enriched/."""
+def iter_networks(folder):
+    """Yield (name, graph) one at a time from subfolders of {folder}/enriched/."""
     folder = Path(folder)
-    networks = {}
     enriched_dir = folder / 'enriched'
     if not enriched_dir.exists():
         print(f"  No enriched/ dir found in {folder}")
-        return networks
+        return
     for npz_file in sorted(enriched_dir.glob('*/graph.npz')):
         name = npz_file.parent.name
         data = np.load(npz_file, allow_pickle=True)
@@ -120,9 +119,8 @@ def load_networks(folder) -> Dict[str, nx.Graph]:
         G = nx.DiGraph() if directed else nx.Graph()
         G.add_nodes_from(data['nodes'].tolist())
         G.add_edges_from(data['edges'].tolist())
-        networks[name] = G
         print(f"  Loaded {name} ({G.number_of_nodes()} nodes, {G.number_of_edges()} edges)")
-    return networks
+        yield name, G
 
 
 # =============================================================================
@@ -205,8 +203,7 @@ class ContagionAnalyzer:
         params = parse_folder_params(folder)
 
         try:
-            networks = load_networks(str(folder))
-            contested_results, ratios = self._sweep_contested(networks, out_path, task_id)
+            contested_results, ratios = self._sweep_contested(folder, out_path, task_id)
 
             results = []
             for net_name, thresh_results in contested_results.items():
@@ -222,19 +219,17 @@ class ContagionAnalyzer:
                         'ratio': ratios.get(net_name),
                     })
 
-            del networks
-            gc.collect()
             return results
 
         except Exception as e:
             print(f"  Error with {folder.name}: {e}")
             return None
 
-    def _sweep_contested(self, networks: Dict, out_path: Path, task_id: int) -> Tuple[Dict, Dict]:
+    def _sweep_contested(self, folder: Path, out_path: Path, task_id: int) -> Tuple[Dict, Dict]:
         results, ratios = {}, {}
         infection_times_all = {}
 
-        for name, G in networks.items():
+        for name, G in iter_networks(str(folder)):
             try:
                 df_n = pd.read_csv(f"Data/aggregated/tab_n_{name}.csv")
                 ratios[name] = df_n.n.max() / df_n.n.sum()
