@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numba
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -24,6 +25,79 @@ import pandas as pd
 # =============================================================================
 # ContagionSimulator
 # =============================================================================
+
+@numba.njit(parallel=True, cache=True)
+def _complex_contagion_kernel(data, indices, indptr, degree, state, threshold, is_fractional, max_steps):
+    """
+    JIT-compiled contagion kernel. Runs all simulations in parallel over nodes.
+
+    Args:
+        data, indices, indptr: CSR sparse adjacency matrix components
+        degree: (n,) node degree array
+        state: (n, n_sims) initial infection state — modified in-place
+        threshold: adoption threshold value
+        is_fractional: True for fractional threshold, False for absolute
+        max_steps: maximum simulation steps
+
+    Returns:
+        time_series: (actual_steps+1, n_sims) int64 array of infected counts
+    """
+    n, n_sims = state.shape
+    infected_counts = np.empty((n, n_sims), dtype=np.float64)
+    time_series = np.empty((max_steps + 1, n_sims), dtype=np.int64)
+
+    # Record initial totals
+    for s in range(n_sims):
+        t = np.int64(0)
+        for i in range(n):
+            t += np.int64(state[i, s] > 0.0)
+        time_series[0, s] = t
+
+    actual_steps = 0
+
+    for step in range(max_steps):
+        # Sparse matmul: infected_counts = adj @ state
+        # prange parallelizes over rows; inner loops are sequential per thread
+        for i in numba.prange(n):
+            row_start = indptr[i]
+            row_end = indptr[i + 1]
+            for s in range(n_sims):
+                val = 0.0
+                for j_ptr in range(row_start, row_end):
+                    val += data[j_ptr] * state[indices[j_ptr], s]
+                infected_counts[i, s] = val
+
+        # Threshold check and state update (each node is independent)
+        for i in numba.prange(n):
+            d = degree[i]
+            for s in range(n_sims):
+                if state[i, s] == 0.0:
+                    ic = infected_counts[i, s]
+                    if is_fractional:
+                        meets = (d > 0.0) and (ic / d >= threshold)
+                    else:
+                        meets = ic >= threshold
+                    if meets:
+                        state[i, s] = 1.0
+
+        # Record totals and check early stopping
+        all_done = True
+        converged = 0
+        for s in range(n_sims):
+            t = np.int64(0)
+            for i in range(n):
+                t += np.int64(state[i, s] > 0.0)
+            time_series[step + 1, s] = t
+            if t != np.int64(n) and t != time_series[step, s]:
+                all_done = False
+            if t == time_series[step, s] or t == np.int64(n):
+                converged += 1
+        actual_steps += 1
+        if all_done:
+            break
+    
+    print(f"converged = {converged}, out of{n_sims}, {actual_steps}")
+    return time_series[:actual_steps + 1]
 
 class ContagionSimulator:
     """Simulates contagion spreading on networks using vectorized sparse operations."""
@@ -100,7 +174,33 @@ class ContagionSimulator:
                             for sim in range(n_simulations)]
         return time_series_list, infection_times
 
+    def complex_contagion_kernel(self, threshold=2, threshold_type='absolute',
+                            initial_infected=1, max_steps=1000, n_simulations=1,
+                            seeding='random'):
+            """
+            Deterministic threshold model.
 
+            Args:
+                threshold: Absolute count or fraction of neighbors needed
+                threshold_type: 'absolute' or 'fractional'
+                initial_infected: Number of seed nodes (for seeding='random')
+                max_steps: Maximum simulation steps
+                n_simulations: Number of parallel runs
+                seeding: 'random' (N random nodes) or 'focal_neighbors'
+                        (a random focal node + all its neighbors)
+            """
+            state = np.zeros((self.n, n_simulations), dtype=np.float64)
+            self._seed_state(state, n_simulations, seeding, initial_infected)
+
+            is_fractional = (threshold_type != 'absolute')
+            ts = _complex_contagion_kernel(
+                self.adj.data, self.adj.indices, self.adj.indptr,
+                self.degree, state, float(threshold), is_fractional, max_steps
+            )
+        
+            # ts shape: (actual_steps+1, n_sims) — convert to list-of-lists per sim
+            return [[int(ts[t, sim]) for t in range(ts.shape[0])]
+                    for sim in range(n_simulations)]
 # =============================================================================
 # Network loader
 # =============================================================================
@@ -236,7 +336,7 @@ class ContagionAnalyzer:
                 del df_n
             except FileNotFoundError:
                 pass
-
+            
             sim = ContagionSimulator(G, name)
             initial = int(len(G) * self.sim.initial_infected_fraction)
             print(f"  Simulating {name} ({len(G)} nodes, {self.sim.n_simulations} sims)...", flush=True)
@@ -244,7 +344,7 @@ class ContagionAnalyzer:
             finals = {}
             for i, tau in enumerate(self.sim.thresholds):
                 print(f"    threshold {i+1}/{len(self.sim.thresholds)} (tau={tau:.3f})", flush=True)
-                ts_list, inf_times = sim.complex_contagion(
+                ts_list, inf_times = sim.complex_contagion_kernel(
                     threshold=tau,
                     threshold_type=self.sim.threshold_type,
                     seeding='focal_neighbors',
