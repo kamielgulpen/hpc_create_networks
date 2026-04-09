@@ -14,7 +14,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import numba
 import networkx as nx
@@ -285,63 +285,48 @@ class ContagionAnalyzer:
         out_path.mkdir(parents=True, exist_ok=True)
         out_file = out_path / f"task_{task_id}.csv"
 
+        self._run_config(folder, out_path, task_id, out_file)
+
         if out_file.exists():
-            print(f"  Already done: {out_file}. Skipping.")
             return pd.read_csv(out_file)
+        return None
 
-        results = self._run_config(folder, out_path, task_id)
-        if not results:
-            print(f"  No results for task {task_id}.")
-            return None
-
-        df = pd.DataFrame(results)
-        df.to_csv(out_file, index=False)
-        print(f"  Saved {len(df)} rows to {out_file}")
-        return df
-
-    def _run_config(self, folder: Path, out_path: Path, task_id: int) -> Optional[List[Dict]]:
+    def _run_config(self, folder: Path, out_path: Path, task_id: int, out_file: Path) -> None:
         params = parse_folder_params(folder)
 
+        # Resume: find which networks are already written
+        done_networks: set = set()
+        if out_file.exists():
+            done_networks = set(pd.read_csv(out_file, usecols=['network'])['network'].unique())
+            print(f"  Resuming — already done: {done_networks}")
+
         try:
-            contested_results, ratios = self._sweep_contested(folder, out_path, task_id)
-
-            results = []
-            for net_name, thresh_results in contested_results.items():
-                for thresh_idx, stat_val in thresh_results.items():
-                    results.append({
-                        **params,
-                        'folder': folder.name,
-                        'network': net_name,
-                        'threshold_idx': thresh_idx,
-                        'threshold_value': self.sim.thresholds[thresh_idx],
-                        'mean_final_adoption': stat_val["mean"],
-                        'variance_final_adoption': stat_val["variance"],
-                        'ratio': ratios.get(net_name),
-                    })
-
-            return results
-
+            self._sweep_contested(folder, out_path, task_id, out_file, params, done_networks)
         except Exception as e:
             print(f"  Error with {folder.name}: {e}")
-            return None
 
-    def _sweep_contested(self, folder: Path, out_path: Path, task_id: int) -> Tuple[Dict, Dict]:
-        results, ratios = {}, {}
-        infection_times_all = {}
-
+    def _sweep_contested(self, folder: Path, out_path: Path, task_id: int,
+                         out_file: Path, params: dict, done_networks: set) -> None:
         for name, G in iter_networks(str(folder)):
+            if name in done_networks:
+                print(f"  Skipping {name} (already saved).")
+                continue
+
+            ratio = None
             try:
                 df_n = pd.read_csv(f"Data/aggregated/tab_n_{name}.csv")
-                ratios[name] = df_n.n.max() / df_n.n.sum()
+                ratio = df_n.n.max() / df_n.n.sum()
                 del df_n
             except FileNotFoundError:
                 pass
             
             sim = ContagionSimulator(G, name)
-            initial = int(len(G) * self.sim.initial_infected_fraction)
-            print(f"  Simulating {name} ({len(G)} nodes, {self.sim.n_simulations} sims)...", flush=True)
+            del G
+            initial = int(sim.n * self.sim.initial_infected_fraction)
+            print(f"  Simulating {name} ({sim.n} nodes, {self.sim.n_simulations} sims)...", flush=True)
 
-            finals = {}
+            infection_times_net = {}
+            rows = []
             for i, tau in enumerate(self.sim.thresholds):
                 print(f"    threshold {i+1}/{len(self.sim.thresholds)} (tau={tau:.3f})", flush=True)
                 ts_list, inf_times = sim.complex_contagion_kernel(
@@ -352,19 +337,35 @@ class ContagionAnalyzer:
                     n_simulations=self.sim.n_simulations,
                     initial_infected=initial,
                 )
-                finals[i] = {
-                    "mean": np.mean([ts[-1] for ts in ts_list]),
-                    "variance": np.var([ts[-1] for ts in ts_list]),
-                }
-                infection_times_all[f"{name}__thresh{i}"] = inf_times
+                rows.append({
+                    **params,
+                    'folder': folder.name,
+                    'network': name,
+                    'threshold_idx': i,
+                    'threshold_value': tau,
+                    'mean_final_adoption': np.mean([ts[-1] for ts in ts_list]),
+                    'variance_final_adoption': np.var([ts[-1] for ts in ts_list]),
+                    'ratio': ratio,
+                })
+                infection_times_net[f"thresh{i}"] = inf_times
                 del ts_list, inf_times
 
-            results[name] = finals
             del sim
-            gc.collect()
 
-        np.savez_compressed(out_path / f"task_{task_id}_infection_times.npz", **infection_times_all)
-        return results, ratios
+            # Save infection times for this network immediately
+            np.savez_compressed(
+                out_path / f"task_{task_id}_infection_times_{name}.npz",
+                **infection_times_net,
+            )
+            del infection_times_net
+
+            # Append this network's rows to CSV immediately
+            write_header = not out_file.exists()
+            pd.DataFrame(rows).to_csv(out_file, mode='a', header=write_header, index=False)
+            print(f"  Saved {len(rows)} rows for {name} to {out_file}")
+            del rows
+
+            gc.collect()
 
 
 # =============================================================================
