@@ -51,6 +51,7 @@ def discover_enriched_pairs():
     pairs = []
     for pop_file in sorted(ENRICHED_AGG_DIR.glob('pop_*.csv')):
         combo_str  = pop_file.stem[len('pop_'):]
+        print(combo_str)
         links_file = ENRICHED_AGG_DIR / f'interactions_{combo_str}.csv'
         if links_file.exists():
             pairs.append((f'enriched/{combo_str}', str(pop_file), str(links_file)))
@@ -215,6 +216,7 @@ def main():
     print(f"Task {task_id}/{n_total - 1}: pref_attachment={pref_att:.4f}, n_communities={n_comms}")
 
     pairs = discover_enriched_pairs()
+
     if not pairs:
         print(f"No enriched pairs found in {ENRICHED_AGG_DIR}. Exiting.")
         return
