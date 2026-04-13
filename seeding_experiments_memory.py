@@ -355,13 +355,13 @@ def iter_networks(folder):
 
 @dataclass
 class SimulationConfig:
-    n_simulations: int = 500
+    n_simulations: int = 200
     max_steps: int = 10000
     threshold_type: str = 'fractional'
     initial_infected_fraction: float = 0.01
     min_threshold: float = 0.05
     max_threshold: float = 0.30
-    n_thresholds: int = 4
+    n_thresholds: int = 3
 
     @property
     def thresholds(self) -> np.ndarray:
@@ -456,7 +456,7 @@ class ContagionAnalyzer:
             rows = []
             for i, tau in enumerate(self.sim.thresholds):
                 print(f"    threshold {i+1}/{len(self.sim.thresholds)} (tau={tau:.3f})", flush=True)
-                ts_list = sim.complex_contagion(
+                ts_list = sim.complex_contagion_kernel(
                     threshold=tau,
                     threshold_type=self.sim.threshold_type,
                     seeding='focal_neighbors',
