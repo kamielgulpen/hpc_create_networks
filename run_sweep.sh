@@ -3,8 +3,8 @@ cd "$(dirname "$0")"
 source .venv/bin/activate
 
 # Configuration
-max_parallel=4
-cores_per_task=8  # Adjust based on your total cores
+max_parallel=6
+cores_per_task=6  # Adjust based on your total cores
 
 # Set Numba threads to avoid oversubscription
 export NUMBA_NUM_THREADS=${cores_per_task}
