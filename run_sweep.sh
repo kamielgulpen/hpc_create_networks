@@ -11,14 +11,14 @@ export NUMBA_NUM_THREADS=${cores_per_task}
 export OMP_NUM_THREADS=${cores_per_task}
 
 running=0
-n_tasks=$(python seeding_experiments_memory.py --list_tasks)
+n_tasks=$(python seeding_experiments.py --list_tasks)
 mkdir -p logs
 
 echo "Starting ${n_tasks} tasks at $(date)"
 echo "Running ${max_parallel} tasks in parallel, ${cores_per_task} cores each"
 
 for task_id in $(seq 0 $((n_tasks - 1))); do
-    PYTHONUNBUFFERED=1 python seeding_experiments_memory.py --task_id ${task_id} \
+    PYTHONUNBUFFERED=1 python seeding_experiments.py --task_id ${task_id} \
         > logs/sweep_${task_id}.out \
         2> logs/sweep_${task_id}.err &
     ((running++))
