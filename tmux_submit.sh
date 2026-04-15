@@ -9,7 +9,7 @@ mkdir -p logs
 
 echo "Starting 100 tasks at $(date)"
 
-for task_id in {0..99}; do
+for task_id in {0..19}; do
     python run_task.py --task_id ${task_id} \
         > logs/task_${task_id}.out \
         2> logs/task_${task_id}.err &
