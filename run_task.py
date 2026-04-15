@@ -109,7 +109,7 @@ def generate_one(pref_att, n_comms, label, pops, links, params):
             scale=SCALE,
             number_of_communities=n_comms,
             output_path=communities_path,
-            mode='capacity',
+            mode='capacity_fast',
             allow_new_communities=False
         )
 
