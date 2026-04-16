@@ -38,7 +38,7 @@ TRANSITIVITY_P    = 0
 BRIDGE_PROBABILITY = 0.2
 
 PREF_ATTACHMENT_VALUES = np.linspace(0, 0.99, 2)
-N_COMMUNITIES_VALUES   = np.logspace(0, 4, 10).astype(int)
+N_COMMUNITIES_VALUES   = np.logspace(4, 5, 3).astype(int)
 
 def all_combinations():
     """Return all (pref_attachment, n_communities) pairs, ordered by task_id."""
