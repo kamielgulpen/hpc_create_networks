@@ -2,11 +2,7 @@
 SLURM array task runner for enriched network generation.
 
 Each array task (SLURM_ARRAY_TASK_ID) maps to one (preferential_attachment,
-n_communities) combination. For that combination, all enriched (pop, links) pairs
-discovered in Data/enriched/aggregated/ are generated and saved as .pkl files.
-
-Usage:
-    python run_task.py --task_id $SLURM_ARRAY_TASK_ID
+n_communities, transitivity, bridge_probability) combination.
 """
 
 import argparse
@@ -28,25 +24,30 @@ from asnu import generate, create_communities
 
 
 # =============================================================================
-# Parameter space (must match generate_enriched_networks.py)
+# Parameter space
 # =============================================================================
 
-ENRICHED_AGG_DIR  = Path('Data/Data/enriched/aggregated')
-SCALE             = 1
-RECIPROCITY_P     = 1
-TRANSITIVITY_P    = 0
-BRIDGE_PROBABILITY = 0.2
+ENRICHED_AGG_DIR = Path('Data/Data/enriched/aggregated')
+SCALE            = 1
+RECIPROCITY_P    = 1
 
-PREF_ATTACHMENT_VALUES = np.linspace(0, 0.9999, 2)
-N_COMMUNITIES_VALUES   = np.logspace(0, 4.7, 10).astype(int)
+PREF_ATTACHMENT_VALUES    = np.linspace(0, 0.9999, 2)
+N_COMMUNITIES_VALUES      = np.logspace(0, 4.7, 10).astype(int)
+TRANSITIVITY_VALUES       = np.linspace(0, 1, 3)
+BRIDGE_PROBABILITY_VALUES = np.linspace(0, 5, 2)
+
 
 def all_combinations():
-    """Return all (pref_attachment, n_communities) pairs, ordered by task_id."""
-    return list(product(PREF_ATTACHMENT_VALUES, N_COMMUNITIES_VALUES))
+    """Return all (pa, n_comms, trans, bridge) pairs, ordered by task_id."""
+    return list(product(
+        PREF_ATTACHMENT_VALUES,
+        N_COMMUNITIES_VALUES,
+        TRANSITIVITY_VALUES,
+        BRIDGE_PROBABILITY_VALUES,
+    ))
 
 
 def discover_enriched_pairs():
-    """Discover all (label, pops_path, links_path) from Data/enriched/aggregated/."""
     pairs = []
     for pop_file in sorted(ENRICHED_AGG_DIR.glob('pop_*.csv')):
         combo_str  = pop_file.stem[len('pop_'):]
@@ -77,14 +78,13 @@ def nx_to_igraph(nx_graph):
     return ig_graph
 
 
-def params_string(pref_att, n_comms):
+def params_string(pref_att, n_comms, trans, bridge):
     return (f"scale={SCALE}_comms={n_comms}"
-            f"_recip={RECIPROCITY_P}_trans={TRANSITIVITY_P}"
-            f"_pa={pref_att:.2f}_bridge={BRIDGE_PROBABILITY}")
+            f"_recip={RECIPROCITY_P}_trans={trans:.2f}"
+            f"_pa={pref_att:.2f}_bridge={bridge:.2f}")
 
 
-def generate_one(pref_att, n_comms, label, pops, links, params):
-    """Generate and save one enriched network."""
+def generate_one(pref_att, n_comms, trans, bridge, label, pops, links, params):
     combo_name = Path(label).name
     output_dir = Path('Data/networks') / Path(label).parent / params
     stats_file = output_dir / f'{combo_name}_stats.json'
@@ -94,7 +94,7 @@ def generate_one(pref_att, n_comms, label, pops, links, params):
         return
 
     print(f"\n{'='*60}")
-    print(f"PA={pref_att:.2f}  comms={n_comms}  [{label}]")
+    print(f"PA={pref_att:.2f}  comms={n_comms}  trans={trans:.2f}  bridge={bridge:.2f}  [{label}]")
     print(f"{'='*60}")
 
     start = time.perf_counter()
@@ -119,10 +119,10 @@ def generate_one(pref_att, n_comms, label, pops, links, params):
             preferential_attachment=pref_att,
             scale=SCALE,
             reciprocity=RECIPROCITY_P,
-            transitivity=TRANSITIVITY_P,
+            transitivity=trans,
             community_file=communities_path,
             base_path=f'my_networks/{params}/{label}',
-            bridge_probability=BRIDGE_PROBABILITY,
+            bridge_probability=bridge,
             fully_connect_communities=False,
             fill_unfulfilled=True,
         )
@@ -137,30 +137,29 @@ def generate_one(pref_att, n_comms, label, pops, links, params):
     degrees = G_ig.degree(mode="in")
 
     community_membership = G_ig.vs['community'] if 'community' in G_ig.vs.attributes() else None
-    if community_membership is not None:
-        modularity = G_ig.modularity(community_membership)
-    else:
-        modularity = None
+    modularity = G_ig.modularity(community_membership) if community_membership is not None else None
 
     net_stats = {
-        'label':             label,
-        'pref_attachment':   round(pref_att, 4),
-        'n_communities':     int(n_comms),
-        'params':            params,
-        'generation_time_s': round(elapsed, 2),
-        'nodes':             G_ig.vcount(),
-        'edges':             G_ig.ecount(),
-        'reciprocity':       round(G_ig.reciprocity(), 4),
-        'transitivity':      round(G_ig.transitivity_undirected(), 4),
-        'modularity':        round(modularity, 4) if modularity is not None else None,
-        'degree_mean':       round(float(np.mean(degrees)), 2),
-        'degree_std':        round(float(np.std(degrees)), 2),
-        'degree_median':     round(float(np.median(degrees)), 1),
-        'degree_min':        int(min(degrees)),
-        'degree_max':        int(max(degrees)),
-        'degree_q1':         round(float(np.quantile(degrees, 0.25)), 1),
-        'degree_q3':         round(float(np.quantile(degrees, 0.75)), 1),
-        'degree_skew':       round(float(stats.skew(degrees)), 4),
+        'label':              label,
+        'pref_attachment':    round(pref_att, 4),
+        'n_communities':      int(n_comms),
+        'transitivity_param': round(float(trans), 4),
+        'bridge_probability': round(float(bridge), 4),
+        'params':             params,
+        'generation_time_s':  round(elapsed, 2),
+        'nodes':              G_ig.vcount(),
+        'edges':              G_ig.ecount(),
+        'reciprocity':        round(G_ig.reciprocity(), 4),
+        'transitivity':       round(G_ig.transitivity_undirected(), 4),
+        'modularity':         round(modularity, 4) if modularity is not None else None,
+        'degree_mean':        round(float(np.mean(degrees)), 2),
+        'degree_std':         round(float(np.std(degrees)), 2),
+        'degree_median':      round(float(np.median(degrees)), 1),
+        'degree_min':         int(min(degrees)),
+        'degree_max':         int(max(degrees)),
+        'degree_q1':          round(float(np.quantile(degrees, 0.25)), 1),
+        'degree_q3':          round(float(np.quantile(degrees, 0.75)), 1),
+        'degree_skew':        round(float(stats.skew(degrees)), 4),
     }
 
     print(f"Nodes: {net_stats['nodes']}, Edges: {net_stats['edges']}")
@@ -211,22 +210,22 @@ def main():
         print(f"Task {task_id} out of range (only {n_total} combinations). Exiting.")
         return
 
-    pref_att, n_comms = combos[task_id]
-    print(f"Task {task_id}/{n_total - 1}: pref_attachment={pref_att:.4f}, n_communities={n_comms}")
+    pref_att, n_comms, trans, bridge = combos[task_id]
+    print(f"Task {task_id}/{n_total - 1}: "
+          f"pa={pref_att:.4f}, comms={n_comms}, trans={trans:.4f}, bridge={bridge:.4f}")
 
     pairs = discover_enriched_pairs()
-
     if not pairs:
         print(f"No enriched pairs found in {ENRICHED_AGG_DIR}. Exiting.")
         return
     print(f"Found {len(pairs)} enriched pairs to generate.")
 
-    params = params_string(pref_att, n_comms)
+    params = params_string(pref_att, n_comms, trans, bridge)
 
     for label, pops, links in pairs:
-        generate_one(pref_att, n_comms, label, pops, links, params)
+        generate_one(pref_att, n_comms, trans, bridge, label, pops, links, params)
 
-    print(f"\nTask {task_id} complete.")
+    print(f"Task {task_id} complete.")
 
 
 if __name__ == '__main__':
