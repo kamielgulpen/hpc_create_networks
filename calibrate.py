@@ -74,7 +74,7 @@ LEVEL_BOUNDS = {
     },
     'etngrp_geslacht': {
         'pa_min': 0.0, 'pa_max': 0.9999,
-        'comms_min': 500, 'comms_max': 200000,
+        'comms_min': 500, 'comms_max': 20000,
         'trans_min': 0.0, 'trans_max': 1.0,
     },
     'geslacht_lft_oplniv': {
@@ -147,6 +147,22 @@ def nx_to_igraph(nx_graph):
     ig_graph.vs["name"] = nodes
     return ig_graph
 
+def robust_label_prop(graph, timeout_s=60, max_retries=3):
+    import signal, random
+    class Timeout(Exception): pass
+    def handler(s, f): raise Timeout()
+    signal.signal(signal.SIGALRM, handler)
+    for attempt in range(max_retries):
+        signal.alarm(timeout_s)
+        try:
+            random.seed(attempt)  # igraph uses Python's random for tie-breaking in some paths
+            return graph.community_label_propagation()
+        except Timeout:
+            continue
+        finally:
+            signal.alarm(0)
+    raise RuntimeError("label propagation failed to converge")
+
 
 def compute_metrics(G_ig):
     """
@@ -155,11 +171,10 @@ def compute_metrics(G_ig):
     """
     degrees      = np.asarray(G_ig.degree(), dtype=np.int32)
     transitivity = float(G_ig.transitivity_avglocal_undirected(mode="zero"))
-    part         = G_ig.community_label_propagation()
+    part         = robust_label_prop(G_ig)
     modularity   = float(G_ig.modularity(part))
     degree_skew  = float(stats.skew(degrees))
     return transitivity, modularity, degree_skew
-
 
 def loss(transitivity, modularity, degree_skew):
     """
