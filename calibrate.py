@@ -150,21 +150,13 @@ def nx_to_igraph(nx_graph):
 def compute_metrics(G_ig):
     degrees      = np.asarray(G_ig.degree(), dtype=np.int32)
     transitivity = float(G_ig.transitivity_avglocal_undirected(mode="zero"))
-
-    # Clean the graph before community detection
-    G_clean = G_ig.simplify(multiple=True, loops=True)
-    # Optionally restrict to the giant component
-    comps = G_clean.connected_components()
-    if len(comps) > 1:
-        G_clean = comps.giant()
-
-    if G_clean.vcount() < 2 or G_clean.ecount() == 0:
+    try:
+        part       = G_ig.community_multilevel()
+        modularity = float(G_ig.modularity(part))
+    except Exception as e:
+        print(f"[compute_metrics] louvain failed: {e}, modularity=NaN", flush=True)
         modularity = float("nan")
-    else:
-        part = G_clean.community_label_propagation()
-        modularity = float(G_clean.modularity(part))
-
-    degree_skew = float(stats.skew(degrees))
+    degree_skew  = float(stats.skew(degrees))
     return transitivity, modularity, degree_skew
 
 def loss(transitivity, modularity, degree_skew):
