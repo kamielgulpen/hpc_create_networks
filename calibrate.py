@@ -147,73 +147,24 @@ def nx_to_igraph(nx_graph):
     ig_graph.vs["name"] = nodes
     return ig_graph
 
-def robust_label_prop(graph, timeout_s=60):
-    """
-    Run label propagation with a timeout. Returns None on any failure.
-
-    Failure modes handled:
-      - Hang / infinite loop  -> SIGALRM fires, returns None
-      - Any Python exception  -> caught, returns None
-      - Empty / trivial graph -> returns None
-      - Invalid result        -> returns None
-
-    Not handled (requires subprocess isolation):
-      - C-level crashes (segfault, double free, abort) kill the process
-    """
-    import signal
-
-    # Guard against degenerate graphs that can trip up C code
-    if graph.vcount() == 0 or graph.ecount() == 0:
-        return None
-
-    class Timeout(Exception):
-        pass
-
-    def handler(signum, frame):
-        raise Timeout()
-
-    # Save any existing handler so we restore it cleanly
-    prev_handler = signal.signal(signal.SIGALRM, handler)
-    signal.alarm(timeout_s)
-
-    try:
-        part = graph.community_label_propagation()
-        # Sanity-check the result before returning
-        if part is None or len(part.membership) != graph.vcount():
-            return None
-        return part
-    except Timeout:
-        return None
-    except Exception:
-        # Any other Python-level failure from igraph: log-and-continue
-        return None
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, prev_handler)
-
-
 def compute_metrics(G_ig):
-    """
-    Compute the three calibration metrics.
-    Returns NaN for modularity if label propagation fails.
-    """
     degrees      = np.asarray(G_ig.degree(), dtype=np.int32)
     transitivity = float(G_ig.transitivity_avglocal_undirected(mode="zero"))
 
-    part = robust_label_prop(G_ig)
-    if part is None:
+    # Clean the graph before community detection
+    G_clean = G_ig.simplify(multiple=True, loops=True)
+    # Optionally restrict to the giant component
+    comps = G_clean.connected_components()
+    if len(comps) > 1:
+        G_clean = comps.giant()
+
+    if G_clean.vcount() < 2 or G_clean.ecount() == 0:
         modularity = float("nan")
     else:
-        try:
-            modularity = float(G_ig.modularity(part))
-        except Exception:
-            modularity = float("nan")
+        part = G_clean.community_label_propagation()
+        modularity = float(G_clean.modularity(part))
 
-    try:
-        degree_skew = float(stats.skew(degrees))
-    except Exception:
-        degree_skew = float("nan")
-
+    degree_skew = float(stats.skew(degrees))
     return transitivity, modularity, degree_skew
 
 def loss(transitivity, modularity, degree_skew):
