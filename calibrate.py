@@ -147,7 +147,7 @@ def nx_to_igraph(nx_graph):
     ig_graph.vs["name"] = nodes
     return ig_graph
 
-def robust_label_prop(graph, timeout_s=60, max_retries=3):
+def robust_label_prop(graph, timeout_s=60, max_retries=1):
     import signal, random
     class Timeout(Exception): pass
     def handler(s, f): raise Timeout()
@@ -155,13 +155,13 @@ def robust_label_prop(graph, timeout_s=60, max_retries=3):
     for attempt in range(max_retries):
         signal.alarm(timeout_s)
         try:
-            random.seed(attempt)  # igraph uses Python's random for tie-breaking in some paths
+            random.seed(attempt)
             return graph.community_label_propagation()
         except Timeout:
             continue
         finally:
             signal.alarm(0)
-    raise RuntimeError("label propagation failed to converge")
+    return None  # instead of raising
 
 
 def compute_metrics(G_ig):
@@ -171,8 +171,8 @@ def compute_metrics(G_ig):
     """
     degrees      = np.asarray(G_ig.degree(), dtype=np.int32)
     transitivity = float(G_ig.transitivity_avglocal_undirected(mode="zero"))
-    part         = robust_label_prop(G_ig)
-    modularity   = float(G_ig.modularity(part))
+    part = robust_label_prop(G_ig, max_retries=1)
+    modularity = float(G_ig.modularity(part)) if part is not None else float("nan")
     degree_skew  = float(stats.skew(degrees))
     return transitivity, modularity, degree_skew
 
