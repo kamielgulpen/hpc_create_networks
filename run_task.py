@@ -32,7 +32,7 @@ SCALE            = 1
 RECIPROCITY_P    = 1
 
 PREF_ATTACHMENT_VALUES    = np.linspace(0, 0.9999, 2)
-N_COMMUNITIES_VALUES      = np.logspace(5000, 20000, 10).astype(int)
+N_COMMUNITIES_VALUES      = np.linspace(5000, 20000, 10).astype(int)
 TRANSITIVITY_VALUES       = np.array([0])
 BRIDGE_PROBABILITY_VALUES = np.array([0])
 
