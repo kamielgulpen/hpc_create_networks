@@ -33,6 +33,7 @@ dependencies = [
     "maturin>=1.11.5",
     "tqdm>=4.67.3",
     "numba>=0.58.1",
+    "networkit>=11.0.1",
 ]
 
 [project.optional-dependencies]

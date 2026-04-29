@@ -1,0 +1,1 @@
+scp -r kamiel@dta170056.science.uva.nl:/home/kamiel/practice/hpc_create_networks/Data/networks/enriched /Desktop/
