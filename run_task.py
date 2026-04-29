@@ -32,9 +32,9 @@ SCALE            = 1
 RECIPROCITY_P    = 1
 
 PREF_ATTACHMENT_VALUES    = np.linspace(0, 0.9999, 2)
-N_COMMUNITIES_VALUES      = np.logspace(0, 4.7, 10).astype(int)
-TRANSITIVITY_VALUES       = np.linspace(0, 1, 3)
-BRIDGE_PROBABILITY_VALUES = np.array([0.2])
+N_COMMUNITIES_VALUES      = np.logspace(5000, 20000, 10).astype(int)
+TRANSITIVITY_VALUES       = np.array([0])
+BRIDGE_PROBABILITY_VALUES = np.array([0])
 
 
 def all_combinations():
@@ -48,10 +48,12 @@ def all_combinations():
 
 
 def discover_enriched_pairs():
+    excluded = ('inkomensniveau', 'arbeidsstatus', 'uitkeringstype', 'burgerlijke_staat')
     pairs = []
     for pop_file in sorted(ENRICHED_AGG_DIR.glob('pop_*.csv')):
-        combo_str  = pop_file.stem[len('pop_'):]
-        print(combo_str)
+        combo_str = pop_file.stem[len('pop_'):]
+        if any(term in combo_str for term in excluded):
+            continue
         links_file = ENRICHED_AGG_DIR / f'interactions_{combo_str}.csv'
         if links_file.exists():
             pairs.append((f'enriched/{combo_str}', str(pop_file), str(links_file)))
