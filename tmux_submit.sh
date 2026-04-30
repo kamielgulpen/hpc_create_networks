@@ -4,7 +4,7 @@ source .venv/bin/activate
 
 max_parallel=5
 running=0
-tasks=120
+tasks=132
 tasks=$((tasks - 1))
 
 mkdir -p logs
