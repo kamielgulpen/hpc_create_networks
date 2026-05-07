@@ -39,7 +39,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 # CONFIGURATION (shared across calls)
 # ============================================================================
 
-EMPIRICAL_NETWORK_PATH = Path("Data/Data/empirical/full_network.pkl")
+EMPIRICAL_NETWORK_PATH = Path("Data/empirical/full_network.pkl")
 OUTPUT_DIR = Path("results")
 N_TRIALS = 25
 N_RUNS_PER_TRIAL = 1
@@ -249,21 +249,12 @@ def compute_stats(G_rx: rx.PyDiGraph, G_nx: nx.DiGraph,
     s["n_communities"] = len(communities)
     s["bridge_widths"] = sorted(bridge_counts.values(), reverse=True)
 
-    # Modularity using NetworkX
+    # Modularity using NetworkX label propagation (matches input script)
     G_undir = G_nx.to_undirected()
     try:
-        from networkx.algorithms.community import louvain_communities
-        communities_nx = list(louvain_communities(G_undir, seed=42))
-    except (ImportError, AttributeError):
-        try:
-            from networkx.algorithms.community.louvain import louvain_communities
-            communities_nx = list(louvain_communities(G_undir, seed=42))
-        except Exception:
-            communities_nx = []
-    
-    if communities_nx:
+        communities_nx = list(nx.community.label_propagation_communities(G_undir))
         s["modularity"] = nx.community.modularity(G_undir, communities_nx)
-    else:
+    except Exception:
         s["modularity"] = 0.0
 
     # Group mixing matrix
