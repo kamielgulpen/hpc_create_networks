@@ -1193,6 +1193,583 @@ fn process_nodes_capacity_fast<'py>(
     Ok(PyArray1::from_owned_array_bound(py, Array1::from(assignments)))
 }
 
+
+// ============================================================================
+// Swap-based community refinement — adaptive sparse/dense storage
+// ============================================================================
+//
+// At a glance:
+//   - For small n_communities × n_groups: dense Vec<Vec<i64>> for comp (fast)
+//   - For large: sparse HashMap with FxHash for cache-efficient lookups
+//   - Biased proposals: 80% of swaps target over/under-budget cells
+//   - Single-pass delta + achieved update over `comm_groups[c1] ∪ comm_groups[c2]`
+//
+// Choose the storage automatically based on a memory budget. The hot-path code
+// is shared — only the comp accessor differs, and that's wrapped in an enum
+// the compiler will monomorphise away on the dense branch.
+// ============================================================================
+
+
+/// 8 bytes per i64 entry. Allow up to ~1 GB before falling back to sparse.
+const DENSE_MEMORY_BUDGET_BYTES: usize = 1_000_000_000;
+
+/// Hot-path composition storage. Two backends share an interface so the
+/// inner loop can be written once.
+enum Comp {
+    Dense(Vec<Vec<i64>>),               // [c][g] -> count
+    Sparse(Vec<HashMap<usize, i64>>),   // [c] -> {g: count}
+}
+
+impl Comp {
+    #[inline(always)]
+    fn get(&self, c: usize, g: usize) -> i64 {
+        match self {
+            Comp::Dense(v) => v[c][g],
+            Comp::Sparse(v) => *v[c].get(&g).unwrap_or(&0),
+        }
+    }
+
+    #[inline(always)]
+    fn set(&mut self, c: usize, g: usize, val: i64) {
+        match self {
+            Comp::Dense(v) => v[c][g] = val,
+            Comp::Sparse(v) => {
+                if val == 0 {
+                    v[c].remove(&g);
+                } else {
+                    v[c].insert(g, val);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn add(&mut self, c: usize, g: usize, delta: i64) {
+        match self {
+            Comp::Dense(v) => v[c][g] += delta,
+            Comp::Sparse(v) => {
+                let entry = v[c].entry(g).or_insert(0);
+                *entry += delta;
+                if *entry == 0 { v[c].remove(&g); }
+            }
+        }
+    }
+}
+
+/// Swap-based refinement of community assignments to better match the edge budget.
+///
+/// Designed to run AFTER a structural initialiser like `process_nodes_capacity_fast`.
+/// Biased proposals target communities where some group is currently over- or
+/// under-represented relative to the budget.
+///
+/// Loss: Σ_{g,h} w(g,h) · (achieved[g,h] − budget[g,h])²
+///   where w = OVERSHOOT_PENALTY when achieved > budget, else 1.0.
+/// achieved[g,h] = Σ_c C[c,g] · C[c,h]
+///
+/// Storage adapts to size: dense Vec<Vec<i64>> when n_communities × n_groups
+/// fits in the memory budget, sparse HashMap otherwise.
+#[pyfunction]
+#[pyo3(signature = (
+    assignments,
+    node_groups,
+    budget,
+    n_groups,
+    n_communities,
+    n_iterations = 100_000,
+    overshoot_penalty = 10.0,
+    temperature_start = 1.0,
+    seed = 42,
+    biased_fraction = 0.8,
+))]
+fn refine_communities_swap<'py>(
+    py: Python<'py>,
+    assignments: PyReadonlyArray1<'py, i64>,
+    node_groups: PyReadonlyArray1<'py, i64>,
+    budget: HashMap<(i64, i64), i64>,
+    n_groups: usize,
+    n_communities: usize,
+    n_iterations: usize,
+    overshoot_penalty: f64,
+    temperature_start: f64,
+    seed: u64,
+    biased_fraction: f64,
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
+    let assignments_in = assignments.as_array();
+    let node_groups_arr = node_groups.as_array();
+    let total_nodes = assignments_in.len();
+
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    // ── Decide storage backend based on memory budget ────────────────────────
+    let dense_bytes = n_communities.saturating_mul(n_groups).saturating_mul(8);
+    let use_dense = dense_bytes <= DENSE_MEMORY_BUDGET_BYTES;
+    println!(
+        "Swap refinement: {} nodes, {} communities, {} groups → {} backend ({:.1} MB)",
+        total_nodes, n_communities, n_groups,
+        if use_dense { "dense" } else { "sparse" },
+        dense_bytes as f64 / 1e6,
+    );
+
+    // ── Sparse budget: B[g] = HashMap<h, target> ─────────────────────────────
+    let mut budget_map: Vec<HashMap<usize, f64>> = (0..n_groups).map(|_| HashMap::new()).collect();
+    for (&(sg, dg), &val) in &budget {
+        if val <= 0 { continue; }
+        let sg = sg as usize;
+        let dg = dg as usize;
+        if sg < n_groups && dg < n_groups {
+            budget_map[sg].insert(dg, val as f64);
+        }
+    }
+
+    // ── Composition storage ─────────────────────────────────────────────────
+    let mut comp = if use_dense {
+        Comp::Dense((0..n_communities).map(|_| vec![0i64; n_groups]).collect())
+    } else {
+        Comp::Sparse((0..n_communities).map(|_| HashMap::new()).collect())
+    };
+
+    let mut current_assign: Vec<usize> = Vec::with_capacity(total_nodes);
+    for i in 0..total_nodes {
+        let c = assignments_in[i] as usize;
+        let g = node_groups_arr[i] as usize;
+        if c < n_communities && g < n_groups {
+            comp.add(c, g, 1);
+        }
+        current_assign.push(c);
+    }
+
+    // ── Inverted index: comm_groups[c] = sorted populated groups in c ────────
+    let mut comm_groups: Vec<Vec<usize>> = (0..n_communities)
+        .map(|c| {
+            let mut v: Vec<usize> = (0..n_groups).filter(|&g| comp.get(c, g) > 0).collect();
+            v.sort_unstable();
+            v
+        })
+        .collect();
+
+    // ── Achieved: A[g] = HashMap<h, count> (sparse, symmetric in pattern) ────
+    let mut achieved: Vec<HashMap<usize, f64>> = (0..n_groups).map(|_| HashMap::new()).collect();
+    for c in 0..n_communities {
+        let groups_in_c = &comm_groups[c];
+        for &g in groups_in_c {
+            let cg = comp.get(c, g) as f64;
+            for &h in groups_in_c {
+                let ch = comp.get(c, h) as f64;
+                *achieved[g].entry(h).or_insert(0.0) += cg * ch;
+            }
+        }
+    }
+
+    // ── Initial loss ─────────────────────────────────────────────────────────
+    let initial_loss = compute_total_loss(&achieved, &budget_map, n_groups, overshoot_penalty);
+    println!("Initial loss = {:.2}", initial_loss);
+
+    // ── Node lookup: comm_group_nodes[(c, g)] = Vec<node_idx> ────────────────
+    let mut comm_group_nodes: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for i in 0..total_nodes {
+        let c = current_assign[i];
+        let g = node_groups_arr[i] as usize;
+        comm_group_nodes.entry((c, g)).or_insert_with(Vec::new).push(i);
+    }
+
+    if n_communities < 2 {
+        println!("Only {} community — nothing to refine.", n_communities);
+        let result: Vec<i64> = current_assign.iter().map(|&c| c as i64).collect();
+        return Ok(PyArray1::from_owned_array_bound(py, Array1::from(result)));
+    }
+
+    // ── Pre-allocated buffers ────────────────────────────────────────────────
+    let mut touched: Vec<usize> = Vec::with_capacity(256);
+
+    // ── Bias index: list of communities containing each group ────────────────
+    // comms_with_group[g] = Vec<c> for picking biased c2.
+    let mut comms_with_group: Vec<Vec<usize>> = (0..n_groups).map(|_| Vec::new()).collect();
+    for c in 0..n_communities {
+        for &g in &comm_groups[c] {
+            comms_with_group[g].push(c);
+        }
+    }
+
+    let mut accepted: usize = 0;
+    let mut current_loss = initial_loss;
+    let report_every = (n_iterations / 10).max(1);
+
+    // ── Main swap loop ───────────────────────────────────────────────────────
+    for iter in 0..n_iterations {
+        let progress = iter as f64 / n_iterations.max(1) as f64;
+        let temperature = (temperature_start * (1.0 - progress)).max(0.0);
+
+        // ── Pick c1, c2, g1, g2 (biased or random) ───────────────────────────
+        let (c1, c2, g1, g2) = if rng.gen::<f64>() < biased_fraction {
+            // Biased: c1 has g1 over-budget; c2 has g2 over-budget;
+            // swapping puts g1 where it's needed and g2 where it's needed.
+            match propose_biased(
+                &comp, &achieved, &budget_map,
+                &comm_groups, &comms_with_group,
+                n_communities, &mut rng,
+            ) {
+                Some(t) => t,
+                None => {
+                    // Fall back to random if biased failed
+                    match propose_random(&comm_groups, n_communities, &mut rng) {
+                        Some(t) => t,
+                        None => continue,
+                    }
+                }
+            }
+        } else {
+            match propose_random(&comm_groups, n_communities, &mut rng) {
+                Some(t) => t,
+                None => continue,
+            }
+        };
+
+        // ── Build `touched` = comm_groups[c1] ∪ comm_groups[c2] ──────────────
+        touched.clear();
+        merge_sorted_unique(&comm_groups[c1], &comm_groups[c2], &mut touched);
+
+        // ── Pre-swap counts (4 lookups, then everything from `touched` loop) ─
+        let c1_g1 = comp.get(c1, g1) as f64;
+        let c1_g2 = comp.get(c1, g2) as f64;
+        let c2_g1 = comp.get(c2, g1) as f64;
+        let c2_g2 = comp.get(c2, g2) as f64;
+        let c1_g1_new = c1_g1 - 1.0;
+        let c1_g2_new = c1_g2 + 1.0;
+        let c2_g1_new = c2_g1 + 1.0;
+        let c2_g2_new = c2_g2 - 1.0;
+
+        // ── Compute delta in a single pass over `touched` ────────────────────
+        let mut delta_loss = 0.0f64;
+        for &h in &touched {
+            let (c1_h_old, c2_h_old) = if h == g1 {
+                (c1_g1, c2_g1)
+            } else if h == g2 {
+                (c1_g2, c2_g2)
+            } else {
+                (comp.get(c1, h) as f64, comp.get(c2, h) as f64)
+            };
+            let c1_h_new = if h == g1 { c1_g1_new } else if h == g2 { c1_g2_new } else { c1_h_old };
+            let c2_h_new = if h == g1 { c2_g1_new } else if h == g2 { c2_g2_new } else { c2_h_old };
+
+            // A[g1, h]
+            let delta_a1 = c1_g1_new * c1_h_new + c2_g1_new * c2_h_new
+                         - c1_g1     * c1_h_old - c2_g1     * c2_h_old;
+            if delta_a1 != 0.0 {
+                let av = *achieved[g1].get(&h).unwrap_or(&0.0);
+                let bv = *budget_map[g1].get(&h).unwrap_or(&0.0);
+                delta_loss += cost_at(av + delta_a1, bv, overshoot_penalty)
+                            - cost_at(av, bv, overshoot_penalty);
+            }
+
+            // A[g2, h]
+            let delta_a2 = c1_g2_new * c1_h_new + c2_g2_new * c2_h_new
+                         - c1_g2     * c1_h_old - c2_g2     * c2_h_old;
+            if delta_a2 != 0.0 {
+                let av = *achieved[g2].get(&h).unwrap_or(&0.0);
+                let bv = *budget_map[g2].get(&h).unwrap_or(&0.0);
+                delta_loss += cost_at(av + delta_a2, bv, overshoot_penalty)
+                            - cost_at(av, bv, overshoot_penalty);
+            }
+
+            // A[h, g1] and A[h, g2] when h ∉ {g1, g2}
+            if h != g1 && h != g2 {
+                let delta_a3 = c1_h_old * c1_g1_new + c2_h_old * c2_g1_new
+                             - c1_h_old * c1_g1     - c2_h_old * c2_g1;
+                if delta_a3 != 0.0 {
+                    let av = *achieved[h].get(&g1).unwrap_or(&0.0);
+                    let bv = *budget_map[h].get(&g1).unwrap_or(&0.0);
+                    delta_loss += cost_at(av + delta_a3, bv, overshoot_penalty)
+                                - cost_at(av, bv, overshoot_penalty);
+                }
+
+                let delta_a4 = c1_h_old * c1_g2_new + c2_h_old * c2_g2_new
+                             - c1_h_old * c1_g2     - c2_h_old * c2_g2;
+                if delta_a4 != 0.0 {
+                    let av = *achieved[h].get(&g2).unwrap_or(&0.0);
+                    let bv = *budget_map[h].get(&g2).unwrap_or(&0.0);
+                    delta_loss += cost_at(av + delta_a4, bv, overshoot_penalty)
+                                - cost_at(av, bv, overshoot_penalty);
+                }
+            }
+        }
+
+        // ── Accept? ──────────────────────────────────────────────────────────
+        let accept = if delta_loss < 0.0 {
+            true
+        } else if temperature > 1e-9 {
+            (-delta_loss / temperature).exp() > rng.gen::<f64>()
+        } else {
+            false
+        };
+        if !accept { continue; }
+
+        // ── Apply node moves ─────────────────────────────────────────────────
+        let nodes_c1_g1 = comm_group_nodes.get_mut(&(c1, g1)).unwrap();
+        let node_a = nodes_c1_g1.pop().unwrap();
+        if nodes_c1_g1.is_empty() { comm_group_nodes.remove(&(c1, g1)); }
+
+        let nodes_c2_g2 = comm_group_nodes.get_mut(&(c2, g2)).unwrap();
+        let node_b = nodes_c2_g2.pop().unwrap();
+        if nodes_c2_g2.is_empty() { comm_group_nodes.remove(&(c2, g2)); }
+
+        comm_group_nodes.entry((c2, g1)).or_insert_with(Vec::new).push(node_a);
+        comm_group_nodes.entry((c1, g2)).or_insert_with(Vec::new).push(node_b);
+        current_assign[node_a] = c2;
+        current_assign[node_b] = c1;
+
+        // ── Update comp ──────────────────────────────────────────────────────
+        comp.add(c1, g1, -1);
+        comp.add(c1, g2,  1);
+        comp.add(c2, g1,  1);
+        comp.add(c2, g2, -1);
+
+        // ── Update inverted indices ──────────────────────────────────────────
+        // c1: g1 may have left (if c1_g1_new == 0), g2 may have arrived (if c1_g2 == 0)
+        if c1_g1_new == 0.0 {
+            comm_groups[c1].retain(|&x| x != g1);
+            comms_with_group[g1].retain(|&x| x != c1);
+        }
+        if c1_g2 == 0.0 {
+            let pos = comm_groups[c1].partition_point(|&x| x < g2);
+            comm_groups[c1].insert(pos, g2);
+            comms_with_group[g2].push(c1);
+        }
+        // c2: g2 may have left, g1 may have arrived
+        if c2_g2_new == 0.0 {
+            comm_groups[c2].retain(|&x| x != g2);
+            comms_with_group[g2].retain(|&x| x != c2);
+        }
+        if c2_g1 == 0.0 {
+            let pos = comm_groups[c2].partition_point(|&x| x < g1);
+            comm_groups[c2].insert(pos, g1);
+            comms_with_group[g1].push(c2);
+        }
+
+        // ── Apply achieved-matrix updates ────────────────────────────────────
+        // Same pass structure as delta computation.
+        for &h in &touched {
+            let (c1_h, c2_h) = if h == g1 {
+                (c1_g1, c2_g1)
+            } else if h == g2 {
+                (c1_g2, c2_g2)
+            } else {
+                (comp.get(c1, h) as f64, comp.get(c2, h) as f64)
+            };
+            let c1_h_new = if h == g1 { c1_g1_new } else if h == g2 { c1_g2_new } else { c1_h };
+            let c2_h_new = if h == g1 { c2_g1_new } else if h == g2 { c2_g2_new } else { c2_h };
+
+            // A[g1, h]
+            let delta1 = c1_g1_new * c1_h_new + c2_g1_new * c2_h_new
+                       - c1_g1     * c1_h     - c2_g1     * c2_h;
+            if delta1 != 0.0 {
+                let entry = achieved[g1].entry(h).or_insert(0.0);
+                *entry += delta1;
+                if *entry == 0.0 { achieved[g1].remove(&h); }
+            }
+
+            // A[g2, h]
+            let delta2 = c1_g2_new * c1_h_new + c2_g2_new * c2_h_new
+                       - c1_g2     * c1_h     - c2_g2     * c2_h;
+            if delta2 != 0.0 {
+                let entry = achieved[g2].entry(h).or_insert(0.0);
+                *entry += delta2;
+                if *entry == 0.0 { achieved[g2].remove(&h); }
+            }
+
+            if h != g1 && h != g2 {
+                let delta3 = c1_h * c1_g1_new + c2_h * c2_g1_new
+                           - c1_h * c1_g1     - c2_h * c2_g1;
+                if delta3 != 0.0 {
+                    let entry = achieved[h].entry(g1).or_insert(0.0);
+                    *entry += delta3;
+                    if *entry == 0.0 { achieved[h].remove(&g1); }
+                }
+
+                let delta4 = c1_h * c1_g2_new + c2_h * c2_g2_new
+                           - c1_h * c1_g2     - c2_h * c2_g2;
+                if delta4 != 0.0 {
+                    let entry = achieved[h].entry(g2).or_insert(0.0);
+                    *entry += delta4;
+                    if *entry == 0.0 { achieved[h].remove(&g2); }
+                }
+            }
+        }
+
+        current_loss += delta_loss;
+        accepted += 1;
+
+        if (iter + 1) % report_every == 0 {
+            println!(
+                "  iter {}/{}: loss={:.2}, accept={:.1}%, T={:.3}",
+                iter + 1, n_iterations, current_loss,
+                100.0 * accepted as f64 / (iter + 1) as f64, temperature
+            );
+        }
+    }
+
+    println!(
+        "Refinement done: {}/{} accepted ({:.1}%), final loss={:.2}, reduction={:.1}%",
+        accepted, n_iterations,
+        100.0 * accepted as f64 / n_iterations.max(1) as f64,
+        current_loss,
+        if initial_loss > 0.0 { 100.0 * (initial_loss - current_loss) / initial_loss } else { 0.0 }
+    );
+
+    let result: Vec<i64> = current_assign.iter().map(|&c| c as i64).collect();
+    Ok(PyArray1::from_owned_array_bound(py, Array1::from(result)))
+}
+
+
+/// Pure random proposal — pick two communities, one populated group from each.
+#[inline]
+fn propose_random(
+    comm_groups: &[Vec<usize>],
+    n_communities: usize,
+    rng: &mut StdRng,
+) -> Option<(usize, usize, usize, usize)> {
+    if n_communities < 2 { return None; }
+    let c1 = rng.gen_range(0..n_communities);
+    let c2 = rng.gen_range(0..n_communities);
+    if c1 == c2 { return None; }
+    if comm_groups[c1].is_empty() || comm_groups[c2].is_empty() { return None; }
+    let g1 = comm_groups[c1][rng.gen_range(0..comm_groups[c1].len())];
+    let g2 = comm_groups[c2][rng.gen_range(0..comm_groups[c2].len())];
+    if g1 == g2 { return None; }
+    Some((c1, c2, g1, g2))
+}
+
+
+/// Biased proposal: pick c1 with a group g1 that's *over*-contributing relative
+/// to budget, and c2 with a group g2 that's also over-contributing. Swapping
+/// them is likely to reduce loss.
+///
+/// Heuristic: sample (c1, g1) by sampling g1 first (uniform from populated
+/// groups in any community), then sampling c1 from the communities containing
+/// g1 weighted by how much g1's presence in c1 contributes to over-budget.
+/// Same for (c2, g2). Cheap approximation, not a global optimiser.
+fn propose_biased(
+    comp: &Comp,
+    achieved: &[HashMap<usize, f64>],
+    budget_map: &[HashMap<usize, f64>],
+    comm_groups: &[Vec<usize>],
+    comms_with_group: &[Vec<usize>],
+    n_communities: usize,
+    rng: &mut StdRng,
+) -> Option<(usize, usize, usize, usize)> {
+    if n_communities < 2 { return None; }
+
+    // Sample two random communities first; pick a group from each that
+    // is "most over-budget" within that community. This is much cheaper than
+    // a global most-over-budget search and still gives directional guidance.
+    let c1 = rng.gen_range(0..n_communities);
+    let c2 = rng.gen_range(0..n_communities);
+    if c1 == c2 || comm_groups[c1].is_empty() || comm_groups[c2].is_empty() {
+        return None;
+    }
+
+    // For c1, find a g where achieved[g, *] is over budget (sample weighted).
+    let g1 = sample_overbudget_group(c1, comp, achieved, budget_map, comm_groups, rng)?;
+    let g2 = sample_overbudget_group(c2, comp, achieved, budget_map, comm_groups, rng)?;
+    if g1 == g2 { return None; }
+
+    // Sanity: both groups must actually be in their communities for a valid swap
+    if comp.get(c1, g1) == 0 || comp.get(c2, g2) == 0 { return None; }
+
+    let _ = comms_with_group; // reserved for stronger biasing later
+    Some((c1, c2, g1, g2))
+}
+
+/// Sample a group from community c, weighted by how much that group's pairs
+/// in c are currently over-budget. Returns None if no over-budget group exists.
+fn sample_overbudget_group(
+    c: usize,
+    comp: &Comp,
+    achieved: &[HashMap<usize, f64>],
+    budget_map: &[HashMap<usize, f64>],
+    comm_groups: &[Vec<usize>],
+    rng: &mut StdRng,
+) -> Option<usize> {
+    let groups = &comm_groups[c];
+    if groups.is_empty() { return None; }
+
+    // Cheap weight: for each g in c, weight = overshoot of A[g, *] summed over
+    // h in c (since these are the pairs g currently contributes to).
+    let mut weights: Vec<f64> = Vec::with_capacity(groups.len());
+    let mut total = 0.0f64;
+    for &g in groups {
+        let cg = comp.get(c, g) as f64;
+        if cg == 0.0 { weights.push(0.0); continue; }
+        let mut w = 0.0;
+        for &h in groups {
+            let av = *achieved[g].get(&h).unwrap_or(&0.0);
+            let bv = *budget_map[g].get(&h).unwrap_or(&0.0);
+            if av > bv { w += av - bv; }
+        }
+        weights.push(w);
+        total += w;
+    }
+
+    if total <= 0.0 {
+        // No over-budget pair in this community; fall back to uniform
+        return Some(groups[rng.gen_range(0..groups.len())]);
+    }
+
+    // Weighted sample
+    let target = rng.gen::<f64>() * total;
+    let mut cum = 0.0;
+    for (i, &w) in weights.iter().enumerate() {
+        cum += w;
+        if cum >= target { return Some(groups[i]); }
+    }
+    Some(*groups.last().unwrap())
+}
+
+
+/// Total loss over all (g, h) pairs where achieved or budget is non-zero.
+fn compute_total_loss(
+    achieved: &[HashMap<usize, f64>],
+    budget_map: &[HashMap<usize, f64>],
+    n_groups: usize,
+    overshoot_penalty: f64,
+) -> f64 {
+    let mut total = 0.0;
+    for g in 0..n_groups {
+        for (&h, &av) in &achieved[g] {
+            let bv = budget_map[g].get(&h).copied().unwrap_or(0.0);
+            total += cost_at(av, bv, overshoot_penalty);
+        }
+        for (&h, &bv) in &budget_map[g] {
+            if !achieved[g].contains_key(&h) {
+                total += cost_at(0.0, bv, overshoot_penalty);
+            }
+        }
+    }
+    total
+}
+
+
+#[inline(always)]
+fn cost_at(achieved_val: f64, budget_val: f64, overshoot_penalty: f64) -> f64 {
+    let diff = achieved_val - budget_val;
+    if diff > 0.0 { overshoot_penalty * diff * diff } else { diff * diff }
+}
+
+
+/// Merge two sorted Vecs into `out`, deduplicating the union. O(|a| + |b|).
+#[inline]
+fn merge_sorted_unique(a: &[usize], b: &[usize], out: &mut Vec<usize>) {
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less    => { out.push(a[i]); i += 1; }
+            std::cmp::Ordering::Greater => { out.push(b[j]); j += 1; }
+            std::cmp::Ordering::Equal   => { out.push(a[i]); i += 1; j += 1; }
+        }
+    }
+    while i < a.len() { out.push(a[i]); i += 1; }
+    while j < b.len() { out.push(b[j]); j += 1; }
+}
+
 /// Python module
 #[pymodule]
 fn asnu_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1201,5 +1778,6 @@ fn asnu_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(process_nodes_capacity, m)?)?;
     m.add_function(wrap_pyfunction!(process_nodes_capacity_sparse, m)?)?;
     m.add_function(wrap_pyfunction!(process_nodes_capacity_fast, m)?)?;
+    m.add_function(wrap_pyfunction!(refine_communities_swap, m)?)?;
     Ok(())
 }

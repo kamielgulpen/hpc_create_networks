@@ -554,7 +554,11 @@ def find_separated_groups(G, num_communities):
     return selected
 
 
-def populate_communities_capacity(G, num_communities, community_size_distribution='natural', new_comm_penalty=3.0, allow_new_communities=True, fast=False, sa_fraction=1.0, overcap_penalty=float('inf'), max_eval=100):
+def populate_communities_capacity(G, num_communities, community_size_distribution='natural',
+                                   new_comm_penalty=3.0, allow_new_communities=True, fast=False,
+                                   sa_fraction=1.0, overcap_penalty=float('inf'), max_eval=100,
+                                   refine_swaps=200000, refine_overshoot_penalty=10.0,
+                                   refine_temperature=1.0, refine_seed=42):
     """
     Assign nodes to communities by matching absolute edge counts against
     maximum_num_links budget, with feasibility constraints ensuring
@@ -571,6 +575,17 @@ def populate_communities_capacity(G, num_communities, community_size_distributio
         Initial number of communities (may grow if needed)
     community_size_distribution : str or array-like, optional
         Controls community size distribution
+    refine_swaps : int, optional
+        Number of swap-refinement iterations to run after assignment.
+        0 disables refinement. Recommended: 50_000–500_000 depending on size.
+        Particularly useful with fast=True, which produces a structurally good
+        but budget-blind starting point that benefits most from refinement.
+    refine_overshoot_penalty : float, optional
+        Multiplier for over-budget cells in the swap loss (default 10.0).
+    refine_temperature : float, optional
+        Initial SA temperature for the swap loop (default 1.0). 0 = pure greedy.
+    refine_seed : int, optional
+        RNG seed for reproducible refinement.
     """
     total_nodes = len(list(G.graph.nodes))
     n_groups = int(len(G.group_ids))
@@ -611,7 +626,7 @@ def populate_communities_capacity(G, num_communities, community_size_distributio
                 G.communities_to_groups[0] = []
             G.communities_to_groups[0].append(group)
         G.number_of_communities = 1
-        G.probability_matrix = np.zeros((0, 0))  # empty placeholder; matrix not needed for 1 community
+        G.probability_matrix = np.zeros((0, 0))
         print(f"\nCapacity-based community assignment complete: "
               f"{total_nodes} nodes -> 1 community (fast path)")
         return
@@ -630,9 +645,6 @@ def populate_communities_capacity(G, num_communities, community_size_distributio
     G.probability_matrix = target
 
     # Build all_nodes in round-robin order across groups for pre-seeding.
-    # This interleaves groups so the SA sees a balanced mix from the start.
-    # Implementation: shuffle once, then sort by within-group position so that
-    # node k of group g ends up in round k — O(n log n), no Python loops over groups.
     all_nodes = np.array(list(G.graph.nodes))
     np.random.shuffle(all_nodes)
     node_groups = np.array([G.nodes_to_group[n] for n in all_nodes])
@@ -648,8 +660,6 @@ def populate_communities_capacity(G, num_communities, community_size_distributio
     node_groups = node_groups[order]
 
     # --- Pre-seed communities from least-interacting groups ---
-    # find_separated_groups selects num_communities groups with minimal mutual
-    # interaction; one node per group seeds each community before the SA starts.
     seeds = find_separated_groups(G, num_communities)
     seed_node_set = {node for _, node in seeds}
 
@@ -664,13 +674,9 @@ def populate_communities_capacity(G, num_communities, community_size_distributio
     mask = np.array([int(n) not in seed_node_set for n in all_nodes])
     sa_nodes = all_nodes[mask]
     sa_groups = node_groups[mask]
-    sa_total_nodes = len(sa_nodes)  # SA backends must use this, not total_nodes
+    sa_total_nodes = len(sa_nodes)
     print(f"  Pre-seeded {len(seeds)} communities from least-interacting groups; "
           f"{sa_total_nodes} nodes remaining for SA")
-
-    # Community structures are populated on demand via setdefault throughout the SA loop;
-    # pre-initialising every (community, group) pair is O(num_communities × n_groups)
-    # and unnecessary — omitted for large-scale performance.
 
     # Try Rust backend, fall back to Python
     try:
@@ -699,9 +705,6 @@ def populate_communities_capacity(G, num_communities, community_size_distributio
             sa_total_nodes,
             effective_penalty,
             rust_initial_comp if initial_comp else None,
-            # sa_fraction,
-            # overcap_penalty,
-            # max_eval,
         )
 
         # Populate G structures from assignments
@@ -727,6 +730,56 @@ def populate_communities_capacity(G, num_communities, community_size_distributio
     print(f"\nCapacity-based community assignment complete: "
           f"{total_nodes} nodes -> {G.number_of_communities} communities")
 
+    # ── Optional swap refinement ──────────────────────────────────────────────
+    # Runs after the initial assignment and before coordinate assignment so
+    # spatial coordinates reflect the refined community structure.
+    if refine_swaps > 0 and G.number_of_communities > 1:
+        try:
+            from asnu_rust import refine_communities_swap
+            print(f"\nRefining communities with {refine_swaps} swap iterations...")
+
+            # Build assignment array in node-index order — must match the order
+            # we'll iterate when rebuilding G structures below.
+            refine_nodes = np.array(list(G.graph.nodes), dtype=np.int64)
+            refine_node_groups = np.array(
+                [G.nodes_to_group[n] for n in refine_nodes], dtype=np.int64
+            )
+            refine_assignments = np.array(
+                [G.nodes_to_communities[int(n)] for n in refine_nodes], dtype=np.int64
+            )
+
+            # Same budget HashMap format as the assignment functions above
+            refine_budget = {(int(k[0]), int(k[1])): int(v)
+                             for k, v in G.maximum_num_links.items() if v > 0}
+
+            new_assignments = refine_communities_swap(
+                refine_assignments,
+                refine_node_groups,
+                refine_budget,
+                n_groups,
+                G.number_of_communities,
+                refine_swaps,
+                refine_overshoot_penalty,
+                refine_temperature,
+                refine_seed,
+            )
+
+            # Rebuild G structures — must clear first since assignments changed
+            G.communities_to_nodes = {}
+            G.communities_to_groups = {}
+            G.nodes_to_communities = {}
+            for i in range(len(refine_nodes)):
+                node = int(refine_nodes[i])
+                comm = int(new_assignments[i])
+                group = int(refine_node_groups[i])
+                G.nodes_to_communities[node] = comm
+                G.communities_to_nodes.setdefault((comm, group), []).append(node)
+                G.communities_to_groups.setdefault(comm, []).append(group)
+
+            print(f"Refinement complete.")
+        except ImportError:
+            print("  refine_communities_swap not available in Rust backend; skipping refinement.")
+
     # Assign random uniform coordinates so Phase B spatial ring search activates.
     K = G.number_of_communities
     _rng = np.random.default_rng(42)
@@ -737,7 +790,6 @@ def populate_communities_capacity(G, num_communities, community_size_distributio
         theta_c = float(comm_coords[int(comm)])
         node_coordinates[int(node_int)] = (theta_c + float(_rng.normal(0, jitter_std))) % 1.0
     G.node_coordinates = node_coordinates
-
 
 def connect_all_within_communities(G, verbose=True):
     """
