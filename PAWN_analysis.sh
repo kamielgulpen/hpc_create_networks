@@ -4,14 +4,14 @@ source .venv/bin/activate
 
 max_parallel=5
 running=0
-tasks=132
+tasks=250
 tasks=$((tasks - 1))
 
 mkdir -p logs
 echo "Starting $((tasks + 1)) tasks at $(date)"
 
 for task_id in $(seq 0 $tasks); do
-    python run_task.py --task_id ${task_id} \
+    python PAWN_analysis.py --task_id ${task_id} \
         > logs/task_${task_id}.out \
         2> logs/task_${task_id}.err &
     ((running++))

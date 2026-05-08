@@ -21,7 +21,7 @@ def load_edges(npz_file):
     if len(edges) == 0:
         return edges.astype(np.int32)
 
-    edges.sort(axis=1)
+    # edges.sort(axis=1)
 
     packed = (edges[:, 0].astype(np.uint64) << 32) | edges[:, 1].astype(np.uint64)
     packed = np.unique(packed)
@@ -35,64 +35,113 @@ def load_edges(npz_file):
 
 def metrics(edges):
     n = int(edges.max()) + 1
-    G = ig.Graph(n=n, directed=False)
+    G = ig.Graph(n=n, directed=True)
     print("edges are loaded, computing metrics...", flush=True)
     try:
         G.add_edges(edges)
     except TypeError:
         G.add_edges(edges.tolist())
 
-    degrees = np.asarray(G.degree(), dtype=np.int32)
+    in_deg = np.asarray(G.indegree(), dtype=np.int32)
+    out_deg = np.asarray(G.outdegree(), dtype=np.int32)
+    tot_deg = in_deg + out_deg
 
-    clusters = G.connected_components()
+    local_clust = np.asarray(
+        G.transitivity_local_undirected(mode="zero"), dtype=np.float64
+    )
+    coreness = np.asarray(G.coreness(mode="all"), dtype=np.int32)
+    pagerank = np.asarray(G.pagerank(directed=True), dtype=np.float64)
+    knn_vals, _ = G.knn()
+    knn = np.asarray([v if v is not None else 0.0 for v in knn_vals], dtype=np.float64)
+
+    # Connectivity
+    clusters = G.connected_components(mode="weak")
     membership = np.asarray(clusters.membership)
     sizes = np.bincount(membership)
-    is_connected = len(sizes) == 1
+    is_weakly_connected = len(sizes) == 1
     lcc_id = int(np.argmax(sizes))
     lcc_size = int(sizes[lcc_id])
 
+    strong_clusters = G.connected_components(mode="strong")
+    strong_sizes = np.bincount(strong_clusters.membership)
+    is_strongly_connected = len(strong_sizes) == 1
+    largest_scc = int(strong_sizes.max())
+
     BIG = 900_000
 
+    def dist_stats(x, prefix):
+        if len(x) == 0:
+            return {f"{prefix}_{k}": 0.0 for k in
+                    ["mean", "std", "min", "q25", "median", "q75", "max", "skew"]}
+        return {
+            f"{prefix}_mean":   float(np.mean(x)),
+            f"{prefix}_std":    float(np.std(x)),
+            f"{prefix}_min":    float(np.min(x)),
+            f"{prefix}_q25":    float(np.quantile(x, 0.25)),
+            f"{prefix}_median": float(np.median(x)),
+            f"{prefix}_q75":    float(np.quantile(x, 0.75)),
+            f"{prefix}_max":    float(np.max(x)),
+            f"{prefix}_skew":   float(stats.skew(x)),
+        }
+
     rec = {
-        "clustering": float(G.transitivity_avglocal_undirected(mode="zero")),
-        "skewness": float(stats.skew(degrees)),
-        "log_degree_skewness": float(stats.skew(np.log1p(degrees))),
         "nodes": n,
         "edges": G.ecount(),
-        "mean_degree": float(degrees.mean()),
-        "q25_degree": float(np.quantile(degrees, 0.25)) if n else 0.0,
-        "q75_degree": float(np.quantile(degrees, 0.75)) if n else 0.0,
-        "skew_degree": float(stats.skew(degrees)) if n else 0.0,
-        "frac_isolates": float((degrees == 0).mean()) if n else 0.0,
-        "frac_degree_1": float((degrees == 1).mean()) if n else 0.0,
-        "is_connected": is_connected,
-        "num_components": int(len(sizes)),
-        "frac_in_lcc": lcc_size / n if n else 0.0,
-        "frac_articulation_points": (
-            len(G.articulation_points()) / n if n and n < BIG else None
-        ),
+        # Node-level distribution stats
+        **dist_stats(in_deg, "in_degree"),
+        **dist_stats(out_deg, "out_degree"),
+        **dist_stats(tot_deg, "total_degree"),
+        **dist_stats(np.log1p(in_deg), "log_in_degree"),
+        **dist_stats(np.log1p(out_deg), "log_out_degree"),
+        **dist_stats(local_clust, "local_clustering"),
+        **dist_stats(coreness, "coreness"),
+        **dist_stats(pagerank, "pagerank"),
+        **dist_stats(knn, "avg_neighbor_degree"),
+        # Special-node fractions
+        "frac_isolates": float((tot_deg == 0).mean()),
+        "frac_sources":  float((in_deg == 0).mean()),
+        "frac_sinks":    float((out_deg == 0).mean()),
+        "frac_degree_1": float((tot_deg == 1).mean()),
+        # Global structural metrics
+        "global_clustering":     float(G.transitivity_undirected(mode="zero")),
+        "avg_local_clustering":  float(G.transitivity_avglocal_undirected(mode="zero")),
+        "reciprocity":           float(G.reciprocity()),
+        "density":               float(G.density()),
+        "max_coreness":          int(coreness.max()) if n else 0,
+        # Connectivity
+        "is_weakly_connected":   is_weakly_connected,
+        "is_strongly_connected": is_strongly_connected,
+        "num_weak_components":   int(len(sizes)),
+        "num_strong_components": int(len(strong_sizes)),
+        "frac_in_lcc_weak":      lcc_size / n if n else 0.0,
+        "frac_in_lscc":          largest_scc / n if n else 0.0,
     }
 
+    # Approx diameter on largest weakly-connected component
     if n > 1:
-        if is_connected:
+        if is_weakly_connected:
             sub = G
         else:
             lcc_nodes = np.where(membership == lcc_id)[0].tolist()
             sub = G.induced_subgraph(lcc_nodes)
         start = np.random.randint(sub.vcount())
-        d1 = sub.distances(source=start)[0]
+        d1 = sub.distances(source=start, mode="all")[0]
         far1 = int(np.argmax([x if x != float('inf') else -1 for x in d1]))
-        d2 = sub.distances(source=far1)[0]
+        d2 = sub.distances(source=far1, mode="all")[0]
         rec["approx_diameter"] = int(max(x for x in d2 if x != float('inf')))
     else:
         rec["approx_diameter"] = 0
 
+    # Modularity
     if n < BIG:
-        part = G.community_label_propagation()
-        rec["modularity"] = float(G.modularity(part))
-        rec["modularity_method"] = "label_propagation"
+        und = G.as_undirected(mode="collapse")
+        part = und.community_label_propagation()
+        rec["modularity"] = float(und.modularity(part))
+        rec["num_communities"] = len(set(part.membership))
+        rec["modularity_method"] = "label_propagation_undirected"
     else:
         rec["modularity"] = None
+        rec["num_communities"] = None
         rec["modularity_method"] = "skipped_large_graph"
 
     print(rec, flush=True)
