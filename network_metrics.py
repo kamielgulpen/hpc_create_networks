@@ -1,12 +1,10 @@
-import json, gc, zipfile
+import argparse
+import json
+import gc
 from pathlib import Path
 import numpy as np
-import pandas as pd
 import igraph as ig
 from scipy import stats
-from tqdm import tqdm
-
-LOUVAIN_EDGE_LIMIT = 5_000
 
 
 def load_edges(npz_file):
@@ -18,17 +16,18 @@ def load_edges(npz_file):
     if arr.ndim != 2 or arr.shape[1] != 2:
         raise ValueError(f"bad shape {arr.shape}")
 
-    edges = arr.astype(np.int32, copy=False)
+    edges = np.ascontiguousarray(arr, dtype=np.int64)
     edges = edges[edges[:, 0] != edges[:, 1]]
     if len(edges) == 0:
-        return edges
+        return edges.astype(np.int32)
 
-    np.sort(edges, axis=1)
-    # Memory-lean dedupe via structured view
-    view = edges.view([("u", edges.dtype), ("v", edges.dtype)]).ravel()
-    view = np.unique(view)
-    edges = view.view(edges.dtype).reshape(-1, 2)
-    del view
+    edges.sort(axis=1)
+
+    packed = (edges[:, 0].astype(np.uint64) << 32) | edges[:, 1].astype(np.uint64)
+    packed = np.unique(packed)
+    edges = np.empty((len(packed), 2), dtype=np.int32)
+    edges[:, 0] = (packed >> 32).astype(np.int32)
+    edges[:, 1] = (packed & 0xFFFFFFFF).astype(np.int32)
 
     _, inv = np.unique(edges.ravel(), return_inverse=True)
     return inv.reshape(-1, 2).astype(np.int32)
@@ -37,11 +36,23 @@ def load_edges(npz_file):
 def metrics(edges):
     n = int(edges.max()) + 1
     G = ig.Graph(n=n, directed=False)
+    print("edges are loaded, computing metrics...", flush=True)
     try:
-        G.add_edges(edges)            # numpy array, no .tolist()
+        G.add_edges(edges)
     except TypeError:
-        G.add_edges(edges.tolist())   # fallback for older igraph
+        G.add_edges(edges.tolist())
+
     degrees = np.asarray(G.degree(), dtype=np.int32)
+
+    clusters = G.connected_components()
+    membership = np.asarray(clusters.membership)
+    sizes = np.bincount(membership)
+    is_connected = len(sizes) == 1
+    lcc_id = int(np.argmax(sizes))
+    lcc_size = int(sizes[lcc_id])
+
+    BIG = 900_000
+
     rec = {
         "clustering": float(G.transitivity_avglocal_undirected(mode="zero")),
         "skewness": float(stats.skew(degrees)),
@@ -54,89 +65,88 @@ def metrics(edges):
         "skew_degree": float(stats.skew(degrees)) if n else 0.0,
         "frac_isolates": float((degrees == 0).mean()) if n else 0.0,
         "frac_degree_1": float((degrees == 1).mean()) if n else 0.0,
+        "is_connected": is_connected,
+        "num_components": int(len(sizes)),
+        "frac_in_lcc": lcc_size / n if n else 0.0,
+        "frac_articulation_points": (
+            len(G.articulation_points()) / n if n and n < BIG else None
+        ),
     }
-    
-    # Average path length (stratified sampling for 800k nodes)
-    n = 0
+
     if n > 1:
-        if G.is_connected():
-            component = list(range(n))
+        if is_connected:
+            sub = G
         else:
-            clusters = G.clusters()
-            component = max(clusters, key=len)
-        
-        # Stratified sampling: low, medium, high degree nodes
-        degrees_subset = degrees[component]
-        low_deg = np.where(degrees_subset <= np.quantile(degrees_subset, 0.33))[0]
-        mid_deg = np.where((degrees_subset > np.quantile(degrees_subset, 0.33)) & 
-                           (degrees_subset <= np.quantile(degrees_subset, 0.67)))[0]
-        high_deg = np.where(degrees_subset > np.quantile(degrees_subset, 0.67))[0]
-        
-        sample_per_stratum = 100  # 900 total samples
-        sampled_idx = np.concatenate([
-            np.random.choice(low_deg, size=min(sample_per_stratum, len(low_deg)), replace=False),
-            np.random.choice(mid_deg, size=min(sample_per_stratum, len(mid_deg)), replace=False),
-            np.random.choice(high_deg, size=min(sample_per_stratum, len(high_deg)), replace=False),
-        ])
-        sampled_nodes = [component[i] for i in sampled_idx]
-        
-        # Compute shortest paths from sampled nodes
-        path_lengths = []
-        for node in sampled_nodes:
-            paths = G.shortest_paths_dijkstra(source=node)[0]
-            finite_paths = [p for p in paths if p != float('inf') and p > 0]
-            if finite_paths:
-                path_lengths.extend(finite_paths)
-        
-        rec["avg_path_length"] = float(np.mean(path_lengths)) if path_lengths else 0.0
-        rec["avg_path_length_sample_size"] = len(sampled_nodes)
+            lcc_nodes = np.where(membership == lcc_id)[0].tolist()
+            sub = G.induced_subgraph(lcc_nodes)
+        start = np.random.randint(sub.vcount())
+        d1 = sub.distances(source=start)[0]
+        far1 = int(np.argmax([x if x != float('inf') else -1 for x in d1]))
+        d2 = sub.distances(source=far1)[0]
+        rec["approx_diameter"] = int(max(x for x in d2 if x != float('inf')))
     else:
-        rec["avg_path_length"] = 0.0
-        rec["avg_path_length_sample_size"] = 0
-    
-    print("GO")
-    part = G.community_label_propagation()
-    rec["modularity"] = float(G.modularity(part))
-    rec["modularity_method"] = "label_propagation"
+        rec["approx_diameter"] = 0
+
+    if n < BIG:
+        part = G.community_label_propagation()
+        rec["modularity"] = float(G.modularity(part))
+        rec["modularity_method"] = "label_propagation"
+    else:
+        rec["modularity"] = None
+        rec["modularity_method"] = "skipped_large_graph"
+
+    print(rec, flush=True)
     return rec
 
-def run(base_dir="my_networks", output_dir="network_metrics"):
+
+def process_file(npz_path, base_dir, output_dir):
+    npz_path = Path(npz_path).resolve()
     base = Path(base_dir).resolve()
-    out = Path(output_dir); out.mkdir(exist_ok=True)
-    files = sorted(base.rglob("*.npz"))
-    print(f"Found {len(files)} files")
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
 
-    results = []
-    with open(out / "results.jsonl", "w") as jsonl:
-        for f in tqdm(files):
-            rel = f.relative_to(base)
-            rec = {
-                "rel_path": str(rel),
-                "experiment": rel.parts[0] if rel.parts else "",
-                "subgroup": "/".join(rel.parts[1:-1]),
-                "filename": f.stem,
-            }
-            try:
-                if f.stat().st_size == 0:
-                    rec["error"] = "empty file"
-                else:
-                    edges = load_edges(f)
-                    if len(edges) == 0:
-                        rec["error"] = "no edges"
-                    else:
-                        rec.update(metrics(edges))
-                        del edges
-                        gc.collect()
-            except Exception as e:
-                rec["error"] = f"{type(e).__name__}: {e}"
-            results.append(rec)
-            jsonl.write(json.dumps(rec, default=float) + "\n")
-            jsonl.flush()
+    try:
+        rel = npz_path.relative_to(base)
+    except ValueError:
+        rel = Path(npz_path.name)
 
-    pd.DataFrame(results).to_csv(out / "results.csv", index=False)
-    errs = sum("error" in r for r in results)
-    print(f"Done. {len(results)-errs} ok, {errs} errors.")
+    rec = {
+        "rel_path": str(rel),
+        "experiment": rel.parts[0] if len(rel.parts) > 1 else "",
+        "subgroup": "/".join(rel.parts[1:-1]),
+        "filename": npz_path.stem,
+    }
+
+    try:
+        if npz_path.stat().st_size == 0:
+            rec["error"] = "empty file"
+        else:
+            edges = load_edges(npz_path)
+            if len(edges) == 0:
+                rec["error"] = "no edges"
+            else:
+                rec.update(metrics(edges))
+                del edges
+                gc.collect()
+    except Exception as e:
+        rec["error"] = f"{type(e).__name__}: {e}"
+
+    # Per-file output - safe for parallel writes
+    safe_name = str(rel).replace("/", "__").replace("\\", "__")
+    out_file = out / f"{safe_name}.json"
+    with open(out_file, "w") as f:
+        json.dump(rec, f, default=float)
+
+    print(f"DONE: {rel}", flush=True)
+    print(rec, flush=True)
+    return rec
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--npz_file", required=True, help="Path to .npz edge file")
+    parser.add_argument("--base_dir", default="my_networks", help="Base dir for relative paths")
+    parser.add_argument("--output_dir", default="network_metrics/per_file", help="Where to write per-file JSON")
+    args = parser.parse_args()
+
+    process_file(args.npz_file, args.base_dir, args.output_dir)
