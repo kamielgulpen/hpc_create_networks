@@ -64,7 +64,7 @@ for f in "${files[@]}"; do
     log_out="$log_dir/task_${task_id}_${safe_name}.out"
     log_err="$log_dir/task_${task_id}_${safe_name}.err"
 
-    python compute_metrics_pawn.py \
+    python compute_metrics.py \
         --npz_file "$f" \
         > "$log_out" \
         2> "$log_err" &
