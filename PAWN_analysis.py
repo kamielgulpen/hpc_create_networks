@@ -32,7 +32,7 @@ SCALE         = 1
 RECIPROCITY_P = 1
 N_SAMPLES     = 250
 RANDOM_SEED   = 42
-PREF_ATTACHMENT = 1 # held fixed
+PREF_ATTACHMENT = 0 # held fixed
 
 PROBLEM = {
     'num_vars': 2,
