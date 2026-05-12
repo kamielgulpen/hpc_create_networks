@@ -20,12 +20,13 @@ import numpy as np
 from scipy import stats
 
 
-NETWORKS_DIR = Path('pawn_results/networks')
+NETWORKS_DIR = Path('')
 METRICS_DIR  = Path('pawn_results/metrics')
 BIG          = 900_000
 
 
 def load_edges(npz_file):
+    print("opening file")
     with np.load(npz_file, allow_pickle=True) as data:
         arr = np.asarray(data[list(data.keys())[0]])
     if arr.ndim == 2 and arr.shape[0] == 2 and arr.shape[1] != 2:
@@ -78,6 +79,7 @@ def compute_metrics(edges):
     tot_deg = in_deg + out_deg
 
     local_clust = np.asarray(G.transitivity_local_undirected(mode="zero"), dtype=np.float64)
+    print(local_clust)
     coreness    = np.asarray(G.coreness(mode="all"),  dtype=np.int32)
     pagerank    = np.asarray(G.pagerank(directed=True), dtype=np.float64)
     knn_vals, _ = G.knn()
@@ -123,6 +125,8 @@ def compute_metrics(edges):
         'frac_in_lscc':           int(strong_sz.max()) / n if n else 0.0,
     }
 
+    print(rec)
+
     if n > 1:
         sub = G if is_weak else G.induced_subgraph(np.where(weak_m == lcc_id)[0].tolist())
         start = np.random.randint(sub.vcount())
@@ -147,6 +151,7 @@ def compute_metrics(edges):
 
 def process_one(npz_path):
     rel = npz_path.relative_to(NETWORKS_DIR)
+    print(rel)
     sample_dir = rel.parts[0]               # sample_XXXXX
     label      = '/'.join(rel.parts[1:-1])  # label
     safe = f"{sample_dir}__{label.replace('/', '__')}"
@@ -182,9 +187,11 @@ def main():
     args = parser.parse_args()
 
     if args.npz_file:
+        print("process")
         process_one(Path(args.npz_file))
+        
         return
-
+    
     task_id = args.task_id
     if task_id is None:
         slurm_id = os.environ.get('SLURM_ARRAY_TASK_ID')
@@ -193,6 +200,7 @@ def main():
         task_id = int(slurm_id)
 
     files = sorted(NETWORKS_DIR.rglob('edges.npz'))
+    print(files)
     if task_id >= len(files):
         print(f"task_id {task_id} out of range ({len(files)} files). Exiting.")
         return
