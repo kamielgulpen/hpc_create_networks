@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 OUTPUT_DIR      = Path('pawn_results')
-NETWORKS_DIR    = OUTPUT_DIR / 'networks'          # folder containing the JSONs
+NETWORKS_DIR    = OUTPUT_DIR / 'metrics'          # folder containing the JSONs
 SAMPLES_FILE    = OUTPUT_DIR / 'samples.csv'
 PER_LABEL_FILE  = OUTPUT_DIR / 'results_per_label.csv'
 AGGREGATED_FILE = OUTPUT_DIR / 'results_aggregated.csv'
