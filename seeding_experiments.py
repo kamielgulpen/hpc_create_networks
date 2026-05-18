@@ -563,9 +563,10 @@ def main():
 
     net_config = NetworkConfig()
 
+    # seeding_experiments.py — change this line in main()
     if args.list_tasks:
         folders = discover_sample_folders(net_config.base_folder)
-        print(f"{len(folders)} sample folders found.")
+        print(len(folders))   # ← just the number, no extra text
         return
 
     task_id = args.task_id
