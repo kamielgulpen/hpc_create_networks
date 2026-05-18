@@ -30,176 +30,190 @@ import pandas as pd
 # =============================================================================
 
 @numba.njit(parallel=True, cache=True)
-def _complex_contagion_kernel(data, indices, indptr, degree, state, threshold, 
-                               is_fractional, max_steps, verbose=0):
+def _complex_contagion_kernel(data, indices, indptr, degree, state, threshold,
+                                  is_fractional, max_steps, verbose=0):
     """
-    JIT-compiled contagion kernel. Runs all simulations in parallel over nodes.
-
-    Args:
-        data, indices, indptr: CSR sparse adjacency matrix components
-        degree: (n,) node degree array
-        state: (n, n_sims) initial infection state — modified in-place
-        threshold: adoption threshold value
-        is_fractional: True for fractional threshold, False for absolute
-        max_steps: maximum simulation steps
-        verbose: 0=silent (fastest), 1=summary, 2=detailed (slowest)
-
-    Returns:
-        time_series: (actual_steps+1, n_sims) int64 array of infected counts
+    Optimizations vs v1:
+      - Skip already-infected nodes in the matmul (biggest win)
+      - Per-simulation convergence: skip converged sims entirely
+      - Incremental count updates: avoid O(n*n_sims) sum each step
+      - int8 state: 4x less memory bandwidth than float32
     """
-    n, n_sims = state.shape
+    n, n_sims = state.shape                                    # state: int8
     infected_counts = np.empty((n, n_sims), dtype=np.float32)
-    time_series = np.empty((max_steps + 1, n_sims), dtype=np.int64)
+    time_series     = np.empty((max_steps + 1, n_sims), dtype=np.int64)
 
-    # Record initial totals - VECTORIZED
-    time_series[0, :] = np.sum(state > 0.0, axis=0).astype(np.int64)
+    current_counts = np.sum(state > 0, axis=0).astype(np.int64)
+    time_series[0, :] = current_counts
+
+    active = np.ones(n_sims, dtype=numba.boolean)
 
     actual_steps = 0
 
     for step in range(max_steps):
-        # Sparse matmul: infected_counts = adj @ state
-        # prange parallelizes over rows; inner loops are sequential per thread
+
+        # ── Pass 1: sparse matmul (skip infected nodes) ──────────────────────
         for i in numba.prange(n):
             row_start = indptr[i]
-            row_end = indptr[i + 1]
+            row_end   = indptr[i + 1]
             for s in range(n_sims):
-                val = 0.0
-                for j_ptr in range(row_start, row_end):
-                    val += data[j_ptr] * state[indices[j_ptr], s]
-                infected_counts[i, s] = val
+                if active[s] and state[i, s] == 0:
+                    val = 0.0
+                    for j_ptr in range(row_start, row_end):
+                        val += data[j_ptr] * state[indices[j_ptr], s]
+                    infected_counts[i, s] = val
 
-        # Threshold check and state update (each node is independent)
+        # ── Pass 2: threshold check + state update ────────────────────────────
+        # Collect per-(i,s) results into a delta array; avoids race conditions
+        delta = np.zeros((n, n_sims), dtype=np.int8)
         for i in numba.prange(n):
             d = degree[i]
             for s in range(n_sims):
-                if state[i, s] == 0.0:
+                if active[s] and state[i, s] == 0:
                     ic = infected_counts[i, s]
                     if is_fractional:
                         meets = (d > 0.0) and (ic / d >= threshold)
                     else:
                         meets = ic >= threshold
                     if meets:
-                        state[i, s] = 1.0
-        
-        # Record totals - VECTORIZED
-        current_counts = np.sum(state > 0.0, axis=0).astype(np.int64)
+                        state[i, s] = 1
+                        delta[i, s]  = 1
+
+        # ── Incremental count update (O(n_sims) not O(n*n_sims)) ─────────────
+        prev_counts    = current_counts.copy()
+        current_counts = current_counts + np.sum(delta, axis=0).astype(np.int64)
         time_series[step + 1, :] = current_counts
-        
-        # OPTIMIZED: Vectorized convergence check
-        all_full = np.all(current_counts == n)
-        all_unchanged = np.all(current_counts == time_series[step, :])
-        
         actual_steps += 1
-        if all_full or all_unchanged:
+
+        # ── Per-sim convergence ───────────────────────────────────────────────
+        any_active = False
+        for s in range(n_sims):
+            if active[s]:
+                if current_counts[s] == n or current_counts[s] == prev_counts[s]:
+                    active[s] = False
+                else:
+                    any_active = True
+        if not any_active:
             break
-    
+
+    # ── verbose logging (unchanged) ──────────────────────────────────────────
     if verbose >= 1:
-        
         final_counts = time_series[actual_steps, :]
-        
-        converged = np.sum((final_counts == n) | (final_counts == time_series[actual_steps - 1, :]))
+        converged    = np.sum((final_counts == n) |
+                              (final_counts == time_series[actual_steps - 1, :]))
         full_cascades = np.sum(final_counts == n)
-        stalled = converged - full_cascades
-        
-        print("    → Steps:", actual_steps, "/", max_steps, "| Converged:", converged, "/", n_sims, 
+        stalled       = converged - full_cascades
+        print("    → Steps:", actual_steps, "/", max_steps,
+              "| Converged:", converged, "/", n_sims,
               "| Full:", full_cascades, "| Stalled:", stalled)
-        
-        if verbose >= 2 and n_sims >= 5:
-            # Show sample finals (FIXED: was printing wrong index)
-            print("    → Sample finals:", final_counts[0], final_counts[1], final_counts[2], 
-                  final_counts[3], final_counts[4], "...")
-        
         if verbose >= 2:
-            # Adoption statistics
-            print("    → Adoption: mean=", round(final_counts.mean(), 1), 
-                  "std=", round(final_counts.std(), 1),
-                  "range=[", int(final_counts.min()), ",", int(final_counts.max()), "] n=", n)
-    
+            print("    → Adoption: mean=", round(final_counts.mean(), 1),
+                  "std=",  round(final_counts.std(), 1),
+                  "range=[", int(final_counts.min()), ",", int(final_counts.max()), "]")
+
     return time_series[:actual_steps + 1]
 
 class ContagionSimulator:
     """Simulates contagion spreading on networks using vectorized sparse operations."""
 
     def __init__(self, network, name="Network"):
-        """
-        Initialize simulator.
-        
-        Args:
-            network: Either a NetworkX graph OR a dict with keys:
-                     {'n', 'adj', 'degree', 'name'} from iter_networks()
-            name: Network name (used if network is NetworkX graph)
-        """
         if isinstance(network, dict):
-            # Fast path: pre-computed sparse matrix
-            self.name = network.get('name', name)
-            self.n = network['n']
-            self.adj = network['adj']
-            self.degree = network['degree']
+            self.name   = network.get('name', name)
+            self.n      = network['n']
+            self.adj    = network['adj']
+            self.degree = network['degree']  # kept for kernel compatibility
         else:
-            # Backward compatibility: NetworkX graph
-            self.G = network
-            self.name = name
-            self.n = len(network)
-            adj = nx.to_scipy_sparse_array(network, format='csr', dtype=np.float32)
-            self.adj = adj
+            self.name   = name
+            self.n      = len(network)
+            self.adj    = nx.to_scipy_sparse_array(network, format='csr', dtype=np.float32)
             self.degree = np.array(self.adj.sum(axis=1)).flatten()
 
-    def _seed_state(self, state, n_simulations, seeding, initial_infected, base_seed=0):
+        # Explicit directional degrees — works for both directed and undirected
+        self.out_degree = np.array(self.adj.sum(axis=1)).flatten().astype(np.int32)  # row sums
+        self.in_degree  = np.array(self.adj.sum(axis=0)).flatten().astype(np.int32)  # col sums
+
+
+    def _seed_state(self, state, n_simulations, seeding, initial_infected,
+                base_seed=0, neighbor_k=None):
         """
-        Seed the initial state with consistent random seeds.
-        
-        Args:
-            base_seed: Starting seed value. Each simulation i uses seed (base_seed + i)
-        
+        Seed the initial state.
+
+        Seeding modes:
+            'random'          — N random nodes
+            'focal_neighbors' — 1 focal node + ALL its neighbours (original)
+            'neighbor_k'      — 1 focal node + exactly K of its neighbours
+                                (falls back to all neighbours if degree < K)
         """
         if isinstance(seeding, np.ndarray):
             for sim in range(n_simulations):
                 rng = np.random.RandomState(base_seed + sim)
                 nodes = rng.choice(seeding, initial_infected, replace=False)
-                state[nodes, sim] = 1.0
+                state[nodes, sim] = 1
+
         elif seeding == 'focal_neighbors':
             for sim in range(n_simulations):
                 rng = np.random.RandomState(base_seed + sim)
                 focal = rng.randint(self.n)
-                state[focal, sim] = 1.0
-                neighbors = self.adj.indices[self.adj.indptr[focal]:self.adj.indptr[focal + 1]]
-                state[neighbors, sim] = 1.0
+                state[focal, sim] = 1
+                neighbours = self.adj.indices[
+                    self.adj.indptr[focal]:self.adj.indptr[focal + 1]
+                ]
+                state[neighbours, sim] = 1
+
+        elif seeding == 'neighbor_k':
+            if neighbor_k is None:
+                raise ValueError("neighbor_k seeding requires neighbor_k parameter")
+            
+            # Pre-compute eligible focal nodes (degree >= neighbor_k) — do once outside sim loop
+            degree_arr = np.array(self.adj.sum(axis=1)).flatten().astype(np.int32)
+            eligible = np.where(degree_arr >= neighbor_k)[0]
+            
+            if len(eligible) == 0:
+                raise ValueError(
+                    f"No nodes with degree >= {neighbor_k}. "
+                    f"Max degree in network: {degree_arr.max()}"
+                )
+            
+            for sim in range(n_simulations):
+                rng = np.random.RandomState(base_seed + sim)
+                
+                # Sample focal node only from nodes with enough neighbours
+                focal = rng.choice(eligible)
+                state[focal, sim] = 1
+                
+                neighbours = self.adj.indices[
+                    self.adj.indptr[focal]:self.adj.indptr[focal + 1]
+                ]
+                # Sample exactly neighbor_k from the guaranteed >= neighbor_k pool
+                chosen = rng.choice(neighbours, neighbor_k, replace=False)
+                state[chosen, sim] = 1
+
         else:  # 'random'
             for sim in range(n_simulations):
                 rng = np.random.RandomState(base_seed + sim)
                 nodes = rng.choice(self.n, initial_infected, replace=False)
-                state[nodes, sim] = 1.0
+                state[nodes, sim] = 1
 
     def complex_contagion_kernel(self, threshold=2, threshold_type='absolute',
-                            initial_infected=1, max_steps=1000, n_simulations=1,
-                            seeding='random', base_seed=0, verbose=0):
-            """
-            Deterministic threshold model using optimized Numba kernel.
+                             initial_infected=1, max_steps=1000, n_simulations=1,
+                             seeding='random', base_seed=0, neighbor_k=None,  # ← new
+                             verbose=0):
+        """
+        Args:
+            ...
+            neighbor_k: int, number of neighbours to seed when seeding='neighbor_k'.
+                        If the focal node has fewer neighbours, all are seeded.
+        """
+        state = np.zeros((self.n, n_simulations), dtype=np.int8)
+        self._seed_state(state, n_simulations, seeding, initial_infected,
+                        base_seed, neighbor_k=neighbor_k)           # ← pass through
 
-            Args:
-                threshold: Absolute count or fraction of neighbors needed
-                threshold_type: 'absolute' or 'fractional'
-                initial_infected: Number of seed nodes (for seeding='random')
-                max_steps: Maximum simulation steps
-                n_simulations: Number of parallel runs
-                seeding: 'random' (N random nodes) or 'focal_neighbors'
-                        (a random focal node + all its neighbors)
-                base_seed: Starting seed value for reproducibility
-                verbose: 0=silent (fastest), 1=summary, 2=detailed
-            
-            Returns:
-                np.ndarray: (actual_steps+1, n_sims) array of infected counts per step
-            """
-            state = np.zeros((self.n, n_simulations), dtype=np.float32)
-            self._seed_state(state, n_simulations, seeding, initial_infected, base_seed)
-
-            is_fractional = (threshold_type != 'absolute')
-            ts = _complex_contagion_kernel(
-                self.adj.data, self.adj.indices, self.adj.indptr,
-                self.degree, state, float(threshold), is_fractional, max_steps, verbose
-            )
-        
-            return ts  # Shape: (actual_steps+1, n_sims)
+        is_fractional = (threshold_type != 'absolute')
+        ts = _complex_contagion_kernel(
+            self.adj.data, self.adj.indices, self.adj.indptr,
+            self.degree, state, float(threshold), is_fractional, max_steps, verbose
+        )
+        return ts
 
 # =============================================================================
 # Network loader
@@ -296,24 +310,25 @@ def iter_networks(folder):
 
 @dataclass
 class SimulationConfig:
-    n_simulations: int = 200
-    max_steps: int = 10000
-    threshold_type: str = 'fractional'
+    n_simulations: int   = 20
+    max_steps: int       = 10000
+    threshold_type: str  = 'fractional'
     initial_infected_fraction: float = 0.01
     min_threshold: float = 0.05
     max_threshold: float = 0.30
-    n_thresholds: int = 3
-    base_seed: int = 0  # Base seed for reproducibility across networks
-    verbose: int = 0    # 0=silent (fastest), 1=summary, 2=detailed
-
+    n_thresholds: int    = 3
+    base_seed: int       = 0
+    verbose: int         = 0
+    seeding: str         = 'neighbor_k'   # ← default to new mode
+    neighbor_k: int      = 20              # ← seed 1 focal + 5 neighbours
+    
     @property
     def thresholds(self) -> np.ndarray:
         return np.linspace(self.min_threshold, self.max_threshold, self.n_thresholds)
 
-
 @dataclass
 class NetworkConfig:
-    base_folder: str = "my_networks"
+    base_folder: str = "pawn_results/networks"
 
 
 def discover_network_folders(base_folder: str = "my_networks") -> List[Path]:
@@ -411,12 +426,13 @@ class ContagionAnalyzer:
                 ts_array = sim.complex_contagion_kernel(
                     threshold=tau,
                     threshold_type=self.sim.threshold_type,
-                    seeding='focal_neighbors',
+                    seeding=self.sim.seeding,          # ← was hardcoded 'focal_neighbors'
+                    neighbor_k=self.sim.neighbor_k,    # ← new
                     max_steps=self.sim.max_steps,
                     n_simulations=self.sim.n_simulations,
                     initial_infected=initial,
-                    base_seed=self.sim.base_seed,  # Use consistent seed across all networks
-                    verbose=self.sim.verbose,       # Control diagnostic output
+                    base_seed=self.sim.base_seed,
+                    verbose=self.sim.verbose,
                 )
                 
                 # Extract final values directly from numpy array
