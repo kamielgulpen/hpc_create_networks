@@ -31,28 +31,26 @@ import pandas as pd
 
 @numba.njit(parallel=True, cache=True)
 def _complex_contagion_kernel(data, indices, indptr, degree, state, threshold,
-                                  is_fractional, max_steps, verbose=0):
-    """
-    Optimizations vs v1:
-      - Skip already-infected nodes in the matmul (biggest win)
-      - Per-simulation convergence: skip converged sims entirely
-      - Incremental count updates: avoid O(n*n_sims) sum each step
-      - int8 state: 4x less memory bandwidth than float32
-    """
-    n, n_sims = state.shape                                    # state: int8
+                               is_fractional, max_steps, verbose=0):
+    n, n_sims = state.shape
     infected_counts = np.empty((n, n_sims), dtype=np.float32)
     time_series     = np.empty((max_steps + 1, n_sims), dtype=np.int64)
 
+    # ── NEW: track infection time per node per sim ────────────────────────────
+    infection_time = np.full((n, n_sims), -1, dtype=np.int16)  # -1 = never
+    # Record seeds (already infected at step 0)
+    for i in numba.prange(n):
+        for s in range(n_sims):
+            if state[i, s] == 1:
+                infection_time[i, s] = 0
+    # ─────────────────────────────────────────────────────────────────────────
+
     current_counts = np.sum(state > 0, axis=0).astype(np.int64)
     time_series[0, :] = current_counts
-
     active = np.ones(n_sims, dtype=numba.boolean)
-
     actual_steps = 0
 
     for step in range(max_steps):
-
-        # ── Pass 1: sparse matmul (skip infected nodes) ──────────────────────
         for i in numba.prange(n):
             row_start = indptr[i]
             row_end   = indptr[i + 1]
@@ -63,29 +61,23 @@ def _complex_contagion_kernel(data, indices, indptr, degree, state, threshold,
                         val += data[j_ptr] * state[indices[j_ptr], s]
                     infected_counts[i, s] = val
 
-        # ── Pass 2: threshold check + state update ────────────────────────────
-        # Collect per-(i,s) results into a delta array; avoids race conditions
         delta = np.zeros((n, n_sims), dtype=np.int8)
         for i in numba.prange(n):
             d = degree[i]
             for s in range(n_sims):
                 if active[s] and state[i, s] == 0:
                     ic = infected_counts[i, s]
-                    if is_fractional:
-                        meets = (d > 0.0) and (ic / d >= threshold)
-                    else:
-                        meets = ic >= threshold
+                    meets = ((d > 0.0) and (ic / d >= threshold)) if is_fractional else (ic >= threshold)
                     if meets:
-                        state[i, s] = 1
-                        delta[i, s]  = 1
+                        state[i, s]          = 1
+                        delta[i, s]          = 1
+                        infection_time[i, s] = step + 1   # ← record step
 
-        # ── Incremental count update (O(n_sims) not O(n*n_sims)) ─────────────
         prev_counts    = current_counts.copy()
         current_counts = current_counts + np.sum(delta, axis=0).astype(np.int64)
         time_series[step + 1, :] = current_counts
         actual_steps += 1
 
-        # ── Per-sim convergence ───────────────────────────────────────────────
         any_active = False
         for s in range(n_sims):
             if active[s]:
@@ -96,22 +88,7 @@ def _complex_contagion_kernel(data, indices, indptr, degree, state, threshold,
         if not any_active:
             break
 
-    # ── verbose logging (unchanged) ──────────────────────────────────────────
-    if verbose >= 1:
-        final_counts = time_series[actual_steps, :]
-        converged    = np.sum((final_counts == n) |
-                              (final_counts == time_series[actual_steps - 1, :]))
-        full_cascades = np.sum(final_counts == n)
-        stalled       = converged - full_cascades
-        print("    → Steps:", actual_steps, "/", max_steps,
-              "| Converged:", converged, "/", n_sims,
-              "| Full:", full_cascades, "| Stalled:", stalled)
-        if verbose >= 2:
-            print("    → Adoption: mean=", round(final_counts.mean(), 1),
-                  "std=",  round(final_counts.std(), 1),
-                  "range=[", int(final_counts.min()), ",", int(final_counts.max()), "]")
-
-    return time_series[:actual_steps + 1]
+    return time_series[:actual_steps + 1], infection_time 
 
 class ContagionSimulator:
     """Simulates contagion spreading on networks using vectorized sparse operations."""
@@ -331,7 +308,7 @@ class NetworkConfig:
     base_folder: str = "pawn_results/networks"
 
 
-def discover_network_folders(base_folder: str = "my_networks") -> List[Path]:
+def discover_network_folders(base_folder: str = "pawn_results/networks") -> List[Path]:
     """Return all parameter folders under base_folder that contain an enriched/ subfolder."""
     base = Path(base_folder)
     return sorted(f for f in base.iterdir() if f.is_dir() and (f / 'enriched').exists())
