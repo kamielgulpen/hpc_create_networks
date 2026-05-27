@@ -556,7 +556,7 @@ def main():
         help='Out-neighbours to seed when --seeding=neighbor_k'
     )
     parser.add_argument(
-        '--n_sims', type=int, default=20,
+        '--n_sims', type=int, default=100,
         help='Number of simulations per threshold'
     )
     args = parser.parse_args()
