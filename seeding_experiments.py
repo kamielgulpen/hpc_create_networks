@@ -364,13 +364,13 @@ def iter_networks(sample_folder):
 
 @dataclass
 class SimulationConfig:
-    n_simulations:            int   = 20
+    n_simulations:            int   = 100
     max_steps:                int   = 10000
     threshold_type:           str   = 'fractional'
     initial_infected_fraction: float = 0.01
-    min_threshold:            float = 0.05
-    max_threshold:            float = 0.30
-    n_thresholds:             int   = 3
+    min_threshold:            float = 0.175
+    max_threshold:            float = 0.175
+    n_thresholds:             int   = 1
     base_seed:                int   = 0
     verbose:                  int   = 0
     seeding:                  str   = 'neighbor_k'
