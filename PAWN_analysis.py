@@ -95,7 +95,7 @@ def edges_from_nx(G):
 
 
 def generate_one(sample_id, params, label, pops, links):
-
+    sample_id = int(sample_id) = 250
     ncom = int(params['n_communities'])
     tr   = float(params['transitivity'])
 
