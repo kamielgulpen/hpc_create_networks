@@ -3,8 +3,7 @@ cd "$(dirname "$0")"
 source .venv/bin/activate
 
 max_parallel=8
-running=0
-tasks=1
+tasks=750
 tasks=$((tasks - 1))
 
 mkdir -p logs
@@ -14,11 +13,12 @@ for task_id in $(seq 0 $tasks); do
     python PAWN_analysis.py --task_id ${task_id} \
         > logs/task_${task_id}.out \
         2> logs/task_${task_id}.err &
-    ((running++))
-    if (( running >= max_parallel )); then
-        wait -n
-        ((running--))
-    fi
+        
+    # Check actual number of running background jobs
+    while [ $(jobs -r -p | wc -l) -ge $max_parallel ]; do
+        sleep 0.5  # Brief pause before checking again
+    done
+
     if (( task_id % 5 == 0 )); then
         echo "Progress: started task ${task_id}"
     fi
