@@ -30,7 +30,7 @@ SAMPLES_FILE     = OUTPUT_DIR / 'samples.csv'
 
 SCALE         = 1
 RECIPROCITY_P = 1
-N_SAMPLES     = 250
+N_SAMPLES     = 750
 RANDOM_SEED   = 42
 PREF_ATTACHMENT = 0 # held fixed
 
@@ -41,7 +41,8 @@ PROBLEM = {
                  [0.0, 1.0]],
 }
 BRIDGE_PROBABILITY = 0.0  # held fixed
-
+samples = latin.sample(PROBLEM, N_SAMPLES, seed=RANDOM_SEED)
+print(samples)
 
 def get_or_create_samples():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,12 +57,30 @@ def get_or_create_samples():
 
 
 def discover_enriched_pairs():
-    excluded = ('inkomensniveau', 'arbeidsstatus', 'uitkeringstype', 'burgerlijke_staat')
+    excluded = (
+        'inkomensniveau', 
+        'arbeidsstatus', 
+        'uitkeringstype', 
+        'burgerlijke_staat',
+        'lft_oplniv',
+        'etngrp_geslacht',
+        'geslacht'
+    )
+    # Explicitly allowed combinations that would otherwise be blocked
+    allowed_exceptions = {
+        'etngrp_geslacht_lft_oplniv',
+        'geslacht_lft_oplniv'
+    }
+    
     pairs = []
     for pop_file in sorted(ENRICHED_AGG_DIR.glob('pop_*.csv')):
         combo = pop_file.stem[len('pop_'):]
-        if any(t in combo for t in excluded):
-            continue
+        
+        # If it's a specific exception, don't exclude it
+        if combo not in allowed_exceptions:
+            if any(t in combo for t in excluded):
+                continue
+                
         links = ENRICHED_AGG_DIR / f'interactions_{combo}.csv'
         if links.exists():
             pairs.append((combo, str(pop_file), str(links)))
