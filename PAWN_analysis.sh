@@ -2,9 +2,9 @@
 cd "$(dirname "$0")"
 source .venv/bin/activate
 
-max_parallel=5
+max_parallel=8
 running=0
-tasks=250
+tasks=1
 tasks=$((tasks - 1))
 
 mkdir -p logs
