@@ -26,7 +26,7 @@ from pathlib import Path
 
 import data_lake
 
-N_SAMPLES = 20
+N_SAMPLES = 200
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
@@ -45,7 +45,7 @@ def run_task(task_id: int, script: str, python: str, logs_dir: Path) -> tuple[in
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tasks", type=int, default=N_SAMPLES)
-    parser.add_argument("--max_parallel", type=int, default=1)
+    parser.add_argument("--max_parallel", type=int, default=5)
     parser.add_argument("--script", default="generate_networks.py")
     parser.add_argument("--python", default=sys.executable)
     args = parser.parse_args()
