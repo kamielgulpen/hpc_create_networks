@@ -10,7 +10,7 @@ from scipy import stats
 from collections import defaultdict
 import igraph as ig
 
-suffix = "geslacht"
+suffix = "etngrp_geslacht_lft_oplniv"
 layer = "buren"
 
 # Generate network
@@ -33,7 +33,7 @@ start = time.perf_counter()
 create_communities(
     pops, links,
     scale=scale,
-    number_of_communities=10796,
+    number_of_communities=1,
     output_path='my_communities.json',
     mode='capacity_fast',
     mixing_floor= 0.3,
@@ -48,7 +48,7 @@ graph = generate(
     preferential_attachment=0.0,     # Preferential attachment strength
     scale=scale,                        # Population scaling
     reciprocity = 1,                    # Reciprocal edge probability
-    transitivity = 0.609851197462374,                 # Friend of a friend is my friend probability
+    transitivity = 0,                 # Friend of a friend is my friend probability
     community_file='my_communities.json',                  
     base_path="my_network",           # Path for the FileBasedGraph's data
     bridge_probability=0,
