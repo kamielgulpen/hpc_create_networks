@@ -60,6 +60,7 @@ def _default_root() -> Path:
          different paths on a cluster vs. your laptop).
       3. A "data_lake" folder next to this file, as a fallback default.
     """
+    
     if PROJECT_ROOT is not None:
         base = Path(PROJECT_ROOT).resolve()
     else:
@@ -72,7 +73,13 @@ def _default_root() -> Path:
 # e.g. PROJECT_ROOT = r"C:\Users\you\pawn_project" on Windows, or
 # PROJECT_ROOT = "/home/you/pawn_project" on Linux/mac. Leave as None to
 # fall back to DATA_LAKE_ROOT / the file-relative default (see above).
-PROJECT_ROOT: str | None = "C:\\Users\\gulpenk\\Documents\\PhD projects\\HPC\\hpc_create_networks"
+
+from pathlib import Path
+
+# Gets the folder containing the running script
+current_folder = Path(__file__).resolve().parent
+
+PROJECT_ROOT: str | None = current_folder
 
 ROOT = _default_root()
 
