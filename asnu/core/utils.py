@@ -42,6 +42,13 @@ def stratified_allocate(items, scale):
 
     return allocations
 
+def _short_label(G, gid):
+    attrs = G.group_to_attrs.get(gid) or G.group_to_attrs.get(str(gid))
+    if not attrs:
+        return str(gid)
+    return ', '.join(str(v) for k, v in attrs.items() if k != 'n')
+
+
 def find_nodes(G, **attrs):
     """
     Finds the list of nodes in the graph associated that have attrs attributes.   
@@ -122,48 +129,6 @@ def check_group_interactions(G, print_report=True):
             'ratio': (act / tgt) if tgt > 0 else float('inf'),
         }
 
-    if print_report:
-        def short_label(gid):
-            attrs = G.group_to_attrs.get(gid) or G.group_to_attrs.get(str(gid))
-            if not attrs:
-                return str(gid)
-            # Show only values, comma-separated (skip 'n' population key)
-            vals = [str(v) for k, v in attrs.items() if k != 'n']
-            return ', '.join(vals)
-
-        W = 24  # column width for group labels
-        header = f"  {'src_group':<{W}} {'dst_group':<{W}} {'target':>8} {'actual':>8} {'diff':>7} {'%':>6}"
-        sep = "  " + "-" * (len(header) - 2)
-
-        # Only show pairs that have a non-zero target or unexpected actual edges
-        visible = {p: r for p, r in results.items() if r['target'] > 0 or r['actual'] > 0}
-        n_ok  = sum(1 for r in visible.values() if abs(r['diff']) / max(r['target'], 1) < 0.05)
-        n_bad = len(visible) - n_ok
-
-        # print("\n" + "=" * len(header))
-        # print(f"  Group interaction check  —  {len(visible)} pairs  |  {n_ok} OK  |  {n_bad} off by >5%")
-        # print("=" * len(header))
-        # print(header)
-        # print(sep)
-
-        total_target = total_actual = 0
-        for (sg, dg), r in sorted(visible.items()):
-            pct = 100 * r['actual'] / r['target'] if r['target'] > 0 else float('inf')
-            flag = " OK" if abs(r['diff']) / max(r['target'], 1) < 0.05 else "!!!"
-            src = short_label(sg)[:W]
-            dst = short_label(dg)[:W]
-            # print(f"  {src:<{W}} {dst:<{W}} {r['target']:>8} {r['actual']:>8} "
-            #       f"{r['diff']:>+7} {pct:>5.1f}%  {flag}")
-            total_target += r['target']
-            total_actual += r['actual']
-
-        overall_pct = 100 * total_actual / total_target if total_target > 0 else float('inf')
-        # print(sep)
-        label_col = f"  TOTAL ({len(visible)} pairs)"
-        # print(f"{label_col:<{2 + W + 1 + W}} {total_target:>8} {total_actual:>8} "
-        #       f"{total_actual - total_target:>+7} {overall_pct:>5.1f}%")
-        # print("=" * len(header) + "\n")
-
     return results
 
 
@@ -184,13 +149,6 @@ def plot_group_interactions(results, G, scatter_path='group_scatter.png', bar_pa
     """
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
-
-    def short_label(gid):
-        attrs = G.group_to_attrs.get(gid) or G.group_to_attrs.get(str(gid))
-        if not attrs:
-            return str(gid)
-        vals = [str(v) for k, v in attrs.items() if k != 'n']
-        return ', '.join(vals)
 
     pairs = sorted(results.keys())
     targets = np.array([results[p]['target'] for p in pairs])
@@ -223,8 +181,8 @@ def plot_group_interactions(results, G, scatter_path='group_scatter.png', bar_pa
         ratio = r['ratio'] if r['target'] > 0 else 2.0
         grid[src_idx[sg], dst_idx[dg]] = ratio
 
-    src_labels = [short_label(g) for g in src_groups]
-    dst_labels = [short_label(g) for g in dst_groups]
+    src_labels = [_short_label(G, g) for g in src_groups]
+    dst_labels = [_short_label(G, g) for g in dst_groups]
 
     cell_size = 0.4
     fig_w = min(max(5, len(dst_groups) * cell_size + 3), 30)
@@ -234,7 +192,6 @@ def plot_group_interactions(results, G, scatter_path='group_scatter.png', bar_pa
     ax2 = fig2.add_subplot(111)
 
     import matplotlib.colors as mcolors
-    cmap = plt.cm.RdYlGn_r  # red=over, yellow=near, green=under; reversed so green=1
     cmap = plt.cm.RdYlGn
     norm = mcolors.TwoSlopeNorm(vmin=0, vcenter=1.0, vmax=2.0)
     im = ax2.imshow(grid, aspect='auto', cmap=cmap, norm=norm)
