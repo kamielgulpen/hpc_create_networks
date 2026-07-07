@@ -56,11 +56,11 @@ EXCLUDED_SUBSTRINGS = (
     'arbeidsstatus',
     'uitkeringstype',
     'burgerlijke_staat',
-    'lft',
-    'etngrp',
-    'geslacht',
-    'etngrp',
-    'oplniv'
+    # 'lft',
+    # 'etngrp',
+    # 'geslacht',
+    # 'etngrp',
+    # 'oplniv'
 
 )
 ALLOWED_EXCEPTIONS = {
