@@ -380,8 +380,100 @@ def analyze_merged_table() -> pd.DataFrame:
     print(f"  shape: {table.shape[0]} rows x {table.shape[1]} columns")
     print(f"  columns: {list(table.columns)}")
     print(table.head().to_string(index=False))
+    return table
 
-    print(table["community_density_by_size_inter_mean"])
+
+def compute_ignition_stats(ignition_threshold_fraction: float = 0.5) -> pd.DataFrame:
+    """
+    Per (network, threshold), simulation-outcome summary from
+    infection_events: what fraction of the n_simulations runs resulted in
+    a large-scale cascade ("ignition") vs fizzling out early.
+
+    ignition_threshold_fraction: a simulation counts as "ignited" if its
+    final adoption fraction (nodes ever infected / total nodes) is >= this
+    value. Default 0.5 -- adjust if "fully ignites" should mean something
+    stricter for your model. full_cascade_probability (exactly 100%
+    adoption) is included separately as an unambiguous, threshold-free
+    alternative -- pick whichever matches what you actually mean.
+    """
+    ie_dir = dl.ROOT / "infection_events"
+    if not ie_dir.exists():
+        return pd.DataFrame()
+
+    rows = []
+    for network_dir in sorted(p for p in ie_dir.iterdir() if p.is_dir()):
+        network_id = network_dir.name
+        for threshold_file in sorted(network_dir.glob("threshold_*.parquet")):
+            events = pd.read_parquet(threshold_file)
+            if events.empty:
+                continue
+
+            total_nodes = events["node_id"].nunique()
+            final_infected = events.groupby("sim")["infection_step"].apply(lambda s: s.notna().sum())
+            final_fraction = final_infected / total_nodes
+
+            rows.append({
+                "network_id":                  network_id,
+                "threshold_idx":               int(events["threshold_idx"].iloc[0]),
+                "threshold_value":             float(events["threshold_value"].iloc[0]),
+                "n_simulations":               int(final_infected.shape[0]),
+                "total_nodes":                 int(total_nodes),
+                "ignition_probability":        float((final_fraction >= ignition_threshold_fraction).mean()),
+                "full_cascade_probability":    float((final_infected == total_nodes).mean()),
+                "mean_final_adoption_fraction": float(final_fraction.mean()),
+                "std_final_adoption_fraction":  float(final_fraction.std()),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def build_full_analysis_table(ignition_threshold_fraction: float = 0.5, save: bool = True) -> pd.DataFrame:
+    """
+    The big table: one row per (network, threshold) combining mixing-pattern
+    features, network topology stats, run parameters, and ignition
+    probability from the diffusion simulations.
+
+    Grain note: topology/mixing/run columns are per-network and get
+    repeated across every threshold that network was simulated at (they
+    don't change per threshold) -- ignition columns are what actually vary
+    per row. If a network has no infection_events yet, it's simply absent
+    from this table (inner-join behavior on the ignition side) rather than
+    showing up with NaN ignition columns; use build_networks_analysis_table()
+    directly if you want every generated network regardless of simulation
+    status.
+
+    Derived/regenerable, same as build_networks_analysis_table -- safe to
+    delete data_lake/analysis_tables/full_table.parquet and rebuild anytime.
+    """
+    ignition = compute_ignition_stats(ignition_threshold_fraction)
+    networks_table = build_networks_analysis_table(save=False)
+
+    if networks_table.empty:
+        print("No networks found yet -- nothing to merge.")
+        return pd.DataFrame()
+
+    if ignition.empty:
+        print("No infection_events found yet -- run the simulation stage first.")
+        return pd.DataFrame()
+
+    table = ignition.merge(networks_table, on="network_id", how="left")
+
+    if save:
+        out_path = dl.ROOT / "analysis_tables" / "full_table.parquet"
+        dl._write_parquet(out_path, table)
+        print(f"  saved: {out_path}")
+
+    return table
+
+
+def analyze_full_table() -> pd.DataFrame:
+    _section("Full analysis table (mixing features + network stats + ignition probability)")
+    table = build_full_analysis_table(save=True)
+    if table.empty:
+        return table
+    print(f"  shape: {table.shape[0]} rows x {table.shape[1]} columns")
+    print(f"  columns: {list(table.columns)}")
+    print(table.head().to_string(index=False))
     return table
 
 
@@ -395,6 +487,7 @@ def main():
     analyze_disk_usage()
     show_table_heads()
     analyze_merged_table()
+    analyze_full_table()
 
 
 if __name__ == "__main__":
