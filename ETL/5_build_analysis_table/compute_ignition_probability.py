@@ -112,7 +112,7 @@ def compute_ignition_probability(ignition_threshold_fraction: float = 0.5,
             pl.col("total_nodes").first(),
             (pl.col("final_fraction") >= ignition_threshold_fraction)
                 .mean().alias("ignition_probability"),
-            (pl.col("n_infected") == pl.col("total_nodes"))
+            (pl.col("n_infected") == pl.col("total_nodes") * 0.9)
                 .mean().alias("full_cascade_probability"),
             pl.col("final_fraction").mean().alias("mean_final_adoption_fraction"),
             pl.col("final_fraction").std().alias("std_final_adoption_fraction"),
@@ -195,4 +195,4 @@ if __name__ == "__main__":
     if "--smoke-test" in sys.argv:
         _smoke_test()
     else:
-        run(ignition_threshold_fraction=0.8, save=True)
+        run()
