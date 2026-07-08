@@ -195,4 +195,4 @@ if __name__ == "__main__":
     if "--smoke-test" in sys.argv:
         _smoke_test()
     else:
-        run()
+        run(ignition_threshold_fraction=0.8, save=True)
