@@ -163,17 +163,25 @@ def compute_ignition_stats(ignition_threshold_fraction: float = 0.5) -> pd.DataF
     for network_dir in sorted(p for p in ie_dir.iterdir() if p.is_dir()):
         network_id = network_dir.name
         for threshold_file in sorted(network_dir.glob("threshold_*.parquet")):
-            events = pd.read_parquet(threshold_file)
+            # threshold_idx is already in the filename -- one less column
+            # to read off disk. Only threshold_value still needs reading
+            # since it's not derivable from the path.
+            threshold_idx = int(threshold_file.stem.removeprefix("threshold_"))
+            events = pd.read_parquet(threshold_file, columns=["sim", "infection_step", "threshold_value"])
             if events.empty:
                 continue
 
-            total_nodes = events["node_id"].nunique()
-            final_infected = events.groupby("sim")["infection_step"].apply(lambda s: s.notna().sum())
+            # every node appears once per sim, so any sim's row count IS
+            # total_nodes -- avoids needing the (expensive, string) node_id
+            # column at all now that we've pruned it from the read above
+            group_sizes = events.groupby("sim").size()
+            total_nodes = int(group_sizes.iloc[0])
+            final_infected = events.groupby("sim")["infection_step"].count()
             final_fraction = final_infected / total_nodes
 
             rows.append({
                 "network_id":                  network_id,
-                "threshold_idx":               int(events["threshold_idx"].iloc[0]),
+                "threshold_idx":               threshold_idx,
                 "threshold_value":             float(events["threshold_value"].iloc[0]),
                 "n_simulations":               int(final_infected.shape[0]),
                 "total_nodes":                 int(total_nodes),
