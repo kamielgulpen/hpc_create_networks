@@ -105,28 +105,43 @@ def run(ignition_threshold_fraction: float = 0.5, save: bool = True) -> pl.DataF
     return result
 
 
-if __name__ == "__main__":
-    # Smoke test: 10 nodes, 4 sims -> [10, 6, 4, 1] infected.
-    # Expect: ignition_probability=0.5, full_cascade_probability=0.25,
-    #         mean_final_adoption_fraction=0.525
+def _smoke_test():
+    """Quick self-check against synthetic data in a throwaway temp dir --
+    does NOT touch your real data lake. Run with --smoke-test."""
     import tempfile
     import pandas as pd  # only used here, to build the test fixture via data_lake
 
-    with tempfile.TemporaryDirectory() as tmp:
-        dl.PROJECT_ROOT = tmp
-        dl.ROOT = dl._default_root()
+    real_root, real_project_root = dl.ROOT, dl.PROJECT_ROOT
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            dl.PROJECT_ROOT = tmp
+            dl.ROOT = dl._default_root()
 
-        rows = []
-        for sim, count in {0: 10, 1: 6, 2: 4, 3: 1}.items():
-            for node in range(10):
-                step = 0 if node < count else float("nan")
-                rows.append({"node_id": str(node), "sim": sim, "infection_step": step})
-        events = pd.DataFrame(rows)
-        dl.write_infection_events("net_A", threshold_idx=0, threshold_value=0.15, events=events)
+            # 10 nodes, 4 sims -> [10, 6, 4, 1] infected.
+            # Expect: ignition_probability=0.5, full_cascade_probability=0.25,
+            #         mean_final_adoption_fraction=0.525
+            rows = []
+            for sim, count in {0: 10, 1: 6, 2: 4, 3: 1}.items():
+                for node in range(10):
+                    step = 0 if node < count else float("nan")
+                    rows.append({"node_id": str(node), "sim": sim, "infection_step": step})
+            events = pd.DataFrame(rows)
+            dl.write_infection_events("net_A", threshold_idx=0, threshold_value=0.15, events=events)
 
-        result = compute_ignition_probability(ignition_threshold_fraction=0.5)
-        print(result)
-        assert result["ignition_probability"][0] == 0.5
-        assert result["full_cascade_probability"][0] == 0.25
-        assert result["mean_final_adoption_fraction"][0] == 0.525
-        print("\nSmoke test passed.")
+            result = compute_ignition_probability(ignition_threshold_fraction=0.5)
+            print(result)
+            assert result["ignition_probability"][0] == 0.5
+            assert result["full_cascade_probability"][0] == 0.25
+            assert result["mean_final_adoption_fraction"][0] == 0.525
+            print("\nSmoke test passed.")
+    finally:
+        dl.ROOT, dl.PROJECT_ROOT = real_root, real_project_root
+
+
+if __name__ == "__main__":
+    import sys
+
+    if "--smoke-test" in sys.argv:
+        _smoke_test()
+    else:
+        run()
