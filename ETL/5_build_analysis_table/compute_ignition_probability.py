@@ -2,18 +2,27 @@
 Part 1/3: compute ignition probability from infection_events.
 
 This is the expensive part of the pipeline -- infection_events files can
-be huge (up to n_nodes x n_simulations rows each). Polars scans all of
-them in one lazy, multi-threaded query with column pruning, instead of
-looping over files and reading full columns in pandas.
+be huge (up to n_nodes x n_simulations rows each) and the whole directory
+can add up to several GB on disk, likely more once decompressed in memory.
+
+Files are processed in BATCHES rather than one query over the whole
+dataset, so peak memory is bounded to roughly "one batch's worth of
+decompressed data" regardless of total dataset size -- this doesn't
+depend on polars' streaming engine actually engaging on your installed
+version, which varies enough across versions that it wasn't worth betting
+on. Each (file, sim) group is entirely contained within a single file, so
+batching never fragments a group -- identical result to a one-shot query,
+just with bounded memory. Tune `batch_size` down if this still runs out
+of memory.
 
 Requires: pip install polars
 
 Could not be executed in this sandbox (no internet access to install
 polars) -- the two-stage aggregation math (raw rows -> per-sim counts ->
-per-network-threshold stats) was validated against known-correct numbers
-using an equivalent pandas implementation, but the polars API calls
-themselves are unverified. Run the smoke test at the bottom of this file
-on your machine before trusting it on real data.
+per-network-threshold stats), including the batching behavior, was
+validated against known-correct numbers using an equivalent pandas
+implementation, but the polars API calls themselves are unverified. Run
+--smoke-test on your machine before trusting this on real data.
 """
 
 from pathlib import Path
@@ -25,45 +34,63 @@ import data_lake as dl
 OUT_FILENAME = "ignition_probability.parquet"
 
 
-def compute_ignition_probability(ignition_threshold_fraction: float = 0.5) -> pl.DataFrame:
+def compute_ignition_probability(ignition_threshold_fraction: float = 0.5,
+                                  batch_size: int = 50) -> pl.DataFrame:
     """
     Per (network, threshold): fraction of simulations that "ignited" (final
     adoption fraction >= ignition_threshold_fraction), plus
     full_cascade_probability (exactly 100% adoption -- an unambiguous,
     threshold-free alternative) and adoption-fraction summary stats.
+
+    Processes files in batches of `batch_size` rather than one query over
+    the whole dataset -- this bounds peak memory to roughly "one batch's
+    worth of decompressed data" regardless of total dataset size, rather
+    than depending on whether the streaming engine is actually engaging
+    on your installed polars version. Each (file, sim) group is entirely
+    contained within a single file, so batching never fragments a group --
+    identical result to a one-shot query, just with bounded memory.
+    Smaller batch_size = lower peak memory, more overhead; tune down if
+    this still gets killed.
     """
+    import gc
+
     ie_dir = dl.ROOT / "infection_events"
     files = sorted(ie_dir.glob("*/threshold_*.parquet"))
     if not files:
         return pl.DataFrame()
 
-    # Nothing is read yet -- scan_parquet is lazy. threshold_idx comes from
-    # the filename (cheap, no need to read it off disk); file_path is
-    # attached as a literal column so we can recover network_id after
-    # aggregation, without depending on a specific polars version's
-    # include_file_paths kwarg.
-    scans = [
-        pl.scan_parquet(f)
-          .select(["sim", "infection_step", "threshold_value"])
-          .with_columns([
-              pl.lit(str(f)).alias("file_path"),
-              pl.lit(int(f.stem.removeprefix("threshold_"))).alias("threshold_idx"),
-          ])
-        for f in files
-    ]
+    n_batches = -(-len(files) // batch_size)  # ceil division
+    per_sim_batches = []
 
-    # Stage 1: per (file, sim) -- the expensive part. Raw node-level rows
-    # collapse down to one row per simulation; everything after this
-    # operates on that tiny result, not the raw data.
-    per_sim = (
-        pl.concat(scans)
-        .group_by(["file_path", "threshold_idx", "threshold_value", "sim"])
-        .agg([
-            pl.col("infection_step").is_not_null().sum().alias("n_infected"),
-            pl.len().alias("total_nodes"),
-        ])
-        .collect()
-    )
+    for i in range(0, len(files), batch_size):
+        batch_files = files[i:i + batch_size]
+        print(f"  batch {i // batch_size + 1}/{n_batches}: "
+              f"files {i}-{i + len(batch_files)} of {len(files)}")
+
+        scans = [
+            pl.scan_parquet(f)
+              .select(["sim", "infection_step", "threshold_idx", "threshold_value"])
+              .with_columns(pl.lit(str(f)).alias("file_path"))
+            for f in batch_files
+        ]
+
+        batch_result = (
+            pl.concat(scans)
+            .group_by(["file_path", "threshold_idx", "threshold_value", "sim"])
+            .agg([
+                pl.col("infection_step").is_not_null().sum().alias("n_infected"),
+                pl.len().alias("total_nodes"),
+            ])
+            .collect()
+        )
+        per_sim_batches.append(batch_result)
+        del scans, batch_result
+        gc.collect()
+
+    per_sim = pl.concat(per_sim_batches)
+    del per_sim_batches
+    gc.collect()
+    print(f"  scanned down to {per_sim.height} per-simulation rows")
 
     if per_sim.is_empty():
         return pl.DataFrame()
@@ -91,17 +118,41 @@ def compute_ignition_probability(ignition_threshold_fraction: float = 0.5) -> pl
             pl.col("final_fraction").std().alias("std_final_adoption_fraction"),
         ])
     )
+    del per_sim
+    gc.collect()
 
     return final
 
 
 def run(ignition_threshold_fraction: float = 0.5, save: bool = True) -> pl.DataFrame:
     result = compute_ignition_probability(ignition_threshold_fraction)
+
+    # Force any large intermediates (per_sim, the raw scan buffers) to
+    # actually be freed before the write allocates anything new. Python's
+    # refcounting should already drop them once compute_ignition_probability()
+    # returns, but polars' underlying Rust allocator can hold memory in
+    # arenas that don't get returned to the OS until GC runs -- if peak
+    # memory during the scan was already close to the ceiling, this is
+    # what decides whether the write's own allocation has room to succeed.
+    import gc
+    gc.collect()
+
+    n_rows = result.height if not result.is_empty() else 0
+    n_cols = len(result.columns) if not result.is_empty() else 0
+    try:
+        size_mb = result.estimated_size("mb") if not result.is_empty() else 0.0
+        print(f"  result table: {n_rows} rows, {n_cols} columns, ~{size_mb:.1f} MB in memory")
+    except AttributeError:
+        print(f"  result table: {n_rows} rows, {n_cols} columns "
+              f"(estimated_size not available on this polars version)")
+
     if save and not result.is_empty():
         out_path = dl.ROOT / "analysis_tables" / OUT_FILENAME
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"  writing to {out_path} ...")
         result.write_parquet(out_path)
         print(f"  saved: {out_path}  ({result.height} rows)")
+
     return result
 
 
