@@ -80,6 +80,8 @@ def read_file(path):
         return pd.read_csv(path)
     elif path.endswith('.xlsx'):
         return pd.read_excel(path)
+    elif path.endswith('.parquet'):
+        return pd.read_parquet(path)
     else:
         raise ValueError("Unsupported file format: {}".format(path))
 

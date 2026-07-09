@@ -577,8 +577,11 @@ fn refine_communities_move<'py>(
         let g = groups[i] as usize;
         let c_old = current[i];
         
-        // Pick a target community: existing OR one brand new potential ID
-        let c_new = rng.gen_range(0..=n_communities);
+        // // Pick a target community: existing OR one brand new potential ID
+        // let c_new = rng.gen_range(0..=n_communities);
+
+        // Pick a target community: existing communities only (no growth)
+        let c_new = rng.gen_range(0..n_communities);
 
         if c_old == c_new { continue; }
 

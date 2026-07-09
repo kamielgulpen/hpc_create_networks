@@ -200,7 +200,7 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
             fraction_of_communities=ncom,
             output_path=communities_path,
             isolation_threshold = 0.8,
-            refine_swaps=1
+            refine_swaps=100000
         )
 
         # Read the community assignment now, while the file still exists --

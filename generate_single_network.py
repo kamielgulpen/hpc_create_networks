@@ -10,23 +10,25 @@ from scipy import stats
 from collections import defaultdict
 import igraph as ig
 
-suffix = ""
-layer = "buren"
+suffix = "geslacht"
+layer = "werkschool"
+
+BASE_PATH = f"data_lake/aggregation_levels/{suffix}"
 
 # Generate network
 # links = 'data/enriched/aggregated/interactions_etngrp_lft_inkomensniveau_arbeidsstatus_burgerlijke_staat.csv'
 # links = f'Data/enriched/aggregated/interactions_{suffix}.csv'
 # links = 'Data/enriched/aggregated/interactions_geslacht.csv'
-links = f'Data/Data/tab_{layer}.csv'
+links = f'{BASE_PATH}/interactions_{layer}.parquet'
 
 # as example we use group interaction data on a work / school layer
 # pops = 'data/enriched/aggregated/pop_etngrp_lft_inkomensniveau_arbeidsstatus_burgerlijke_staat.csv' 
 # pops  = f'Data/enriched/aggregated/pop_{suffix}.csv'
 # pops  = 'Data/enriched/aggregated/pop_geslacht.csv'
-pops = f'Data/Data/tab_n_(with oplniv).csv'
+pops = f'{BASE_PATH}/population.parquet'
 
 scale = 0.01
-fraction_of_communities = 0.001
+fraction_of_communities = 0.1
 transitivity = 0
 bridge_probability = 0
 start = time.perf_counter()
@@ -39,7 +41,7 @@ create_communities(
     fraction_of_communities=fraction_of_communities,
     output_path='my_communities.json',
     isolation_threshold = 0.8,
-    refine_swaps=1
+    refine_swaps=500000
 
 )
 
@@ -49,9 +51,9 @@ graph = generate(
     preferential_attachment=  0,     # The group-level interaction data
     scale=scale,                        # Population scaling
     reciprocity = 1,                    # Reciprocal edge probability
-    transitivity = 1,        # Friend of a friend is my friend probability
-    internal_transitivity = 1,
-    external_transitivity = 1,
+    transitivity = 0,        # Friend of a friend is my friend probability
+    internal_transitivity = 0,
+    external_transitivity = 0,
     community_file='my_communities.json',                  
     base_path="my_network",              # Path for the FileBasedGraph's data
     bridge_probability=bridge_probability,
