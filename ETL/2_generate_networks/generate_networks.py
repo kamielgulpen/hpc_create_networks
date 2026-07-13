@@ -35,19 +35,12 @@ from run_parallel_generate_network import N_SAMPLES
 
 SCALE           = 0.01
 RECIPROCITY_P   = 1
-N_SAMPLES       = N_SAMPLES
+N_SAMPLES       = N_SAMPLES *2
 RANDOM_SEED     = 42
 PREF_ATTACHMENT = 0  # held fixed
 BRIDGE_PROBABILITY = 0.0  # held fixed
 POP = 861000 * SCALE
 
-PROBLEM = {
-    'num_vars': 3,
-    'names':    ['n_communities', 'transitivity', 'optimize'],
-    'bounds':   [[1/POP,   1.0],
-                 [0.0, 1.0],
-                 [0.0, 1.0]],
-}
 
 # Same inclusion/exclusion policy as the original discover_enriched_pairs(),
 # now applied to data-lake aggregation levels instead of pop_*.csv filenames.
