@@ -14,7 +14,17 @@ print(df.head())
 
 df['cc'] = df['network_id'].str.split('__').str[1]
 
-metrics = ['avg_neighbor_degree_min', 'local_clustering_q25', 'pagerank_skew', 'density', 'detected_community_density_by_size_intra_std', 'detected_community_density_by_size_intra_q75', 'gen_time_s', 'local_clustering_skew', 'frac_in_lscc', 'detected_community_density_by_size_inter_q75', 'avg_neighbor_degree_q25', 'frac_sinks', 'detected_community_density_by_size_inter_skew', 'local_clustering_max', 'ignition_probability']
+metrics = ['detected_community_edges_inter_mean', 'detected_community_density_by_minsize_inter_mean', 'coreness_skew', 'detected_community_edges_inter_skew', 'detected_community_density_by_minsize_inter_skew', 'global_clustering', 'detected_community_density_by_degree_intra_q25', 'detected_community_density_by_minsize_intra_skew', 'num_communities', 'detected_community_density_by_size_intra_mean']
+
+
+plt.scatter(df["mix_familie_homophily_coleman_mean"], df["mix_familie_hhi_overall"], c= "red")
+plt.scatter(df["mix_buren_homophily_coleman_mean"], df["mix_buren_hhi_overall"], c = "blue")
+plt.scatter(df["mix_werkschool_homophily_coleman_mean"], df["mix_werkschool_hhi_overall"], c = "green")
+
+plt.show()
+
+for i in df.columns:
+    print(i)
 
 SEQUENTIAL = LinearSegmentedColormap.from_list(
     "seq_teal_purple",
@@ -122,9 +132,169 @@ def ridgeline(df, cols, hhi_col, agg_col, out_path=None,
         print(f"Saved -> {out_path}")
     return fig
 
+# =====================================================================
+# Q1: How much of the topology is fixed by the mixing-pattern constraints
+#     versus filled in by the generator's residual freedom?
+#
+#   within-setting spread  = spread of a metric across replicate networks
+#                            that share a `cc` (same constraints)  -> generator freedom
+#   across-setting spread  = spread of the per-`cc` MEANS across `cc` groups
+#                            (i.e. how much changing the constraints moves the metric)
+#   ratio                  = within / across.  <1 -> constraints dominate (generator
+#                            well-behaved);  >1 -> generator's freedom swamps the
+#                            constraint effect (metric barely controlled by constraints)
+#
+# Assumes `df`, `metrics`, and the `cc` column already exist (defined above).
+# =====================================================================
+
+
+def q1_spread_table(df, cols, group_col="cc", spread="std", min_per_group=2):
+    """Return a per-metric table of within-setting vs across-setting spread.
+
+    spread : "std"  -> use standard deviation as the spread measure
+             "iqr"  -> use inter-quartile range (robust to outliers/skew)
+
+    For each metric:
+      within_setting  = mean over groups of the within-group spread
+                        (average generator wiggle at fixed constraints)
+      across_setting  = spread of the per-group means
+                        (movement due to changing constraints)
+      ratio           = within_setting / across_setting
+    """
+    def _spread(v):
+        v = np.asarray(v, float)
+        v = v[np.isfinite(v)]
+        if v.size < min_per_group:
+            return np.nan
+        if spread == "iqr":
+            q75, q25 = np.percentile(v, [75, 25])
+            return q75 - q25
+        return v.std(ddof=1)
+
+    rows = []
+    for col in cols:
+        sub = df[[group_col, col]].dropna()
+        # size of each group (how many replicate networks per constraint setting)
+        sizes = sub.groupby(group_col)[col].size()
+        usable = sizes[sizes >= min_per_group].index
+        sub = sub[sub[group_col].isin(usable)]
+        if sub[group_col].nunique() < 2:
+            rows.append(dict(metric=col, within_setting=np.nan,
+                             across_setting=np.nan, ratio=np.nan,
+                             n_groups=sub[group_col].nunique(),
+                             median_group_size=np.nan))
+            continue
+
+        grouped = sub.groupby(group_col)[col]
+        within_per_group = grouped.apply(_spread)          # generator freedom per setting
+        group_means = grouped.mean()                       # mean topology per setting
+
+        within = np.nanmean(within_per_group.values)       # avg generator wiggle
+        across = _spread(group_means.values)               # constraint-driven movement
+        ratio = within / across if (across and np.isfinite(across) and across > 0) else np.nan
+
+        rows.append(dict(
+            metric=col,
+            within_setting=within,
+            across_setting=across,
+            ratio=ratio,
+            n_groups=int(sub[group_col].nunique()),
+            median_group_size=float(sizes.loc[usable].median()),
+        ))
+
+    tbl = pd.DataFrame(rows).set_index("metric")
+    tbl = tbl.sort_values("ratio")
+    return tbl
+
+
+def plot_q1_spread(tbl, out_path=None,
+                   title="Q1: generator freedom vs constraint effect"):
+    """Horizontal bar chart of the within/across ratio, one bar per metric.
+
+    ratio < 1 (left of the line) : constraints dominate the metric -> generator
+                                   is well-behaved for that topological feature.
+    ratio > 1 (right of the line): the generator's residual freedom swamps the
+                                   constraint effect -> constraints barely control
+                                   that feature.
+    """
+    t = tbl.dropna(subset=["ratio"]).copy()
+    if t.empty:
+        print("q1: no metric had >=2 usable groups; nothing to plot.")
+        return None
+
+    t = t.sort_values("ratio")
+    y = np.arange(len(t))
+    colors = ["#1f8a8c" if r < 1 else "#5b2a86" for r in t["ratio"]]
+
+    fig, ax = plt.subplots(figsize=(7.5, max(3.0, 0.42 * len(t))),
+                           layout="constrained")
+    ax.barh(y, t["ratio"], color=colors, height=0.68, zorder=3)
+    ax.axvline(1.0, color="0.35", lw=1.2, ls="--", zorder=2)
+    ax.text(1.0, len(t) - 0.35, "  generator = constraint", fontsize=8,
+            color="0.35", va="top", ha="left")
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(t.index, fontsize=9)
+    ax.set_xlabel("within-setting spread  /  across-setting spread", fontsize=9)
+    ax.set_title(title, fontsize=13, fontweight="bold", pad=10)
+    ax.margins(y=0.02)
+    for s in ("top", "right", "left"):
+        ax.spines[s].set_visible(False)
+    ax.spines["bottom"].set_color("0.75")
+    ax.tick_params(axis="x", labelsize=8, colors="0.4")
+
+    # annotate each bar with its ratio
+    xmax = t["ratio"].max()
+    for yi, r in zip(y, t["ratio"]):
+        ax.text(r + xmax * 0.01, yi, f"{r:.2f}", va="center",
+                fontsize=7.5, color="0.4")
+
+    if out_path:
+        fig.savefig(out_path, dpi=170, bbox_inches="tight", facecolor="white")
+        print(f"Saved -> {out_path}")
+    return fig
+
+
+def q1_summary(tbl):
+    """One-line-per-metric verdict plus an overall headline for Q1."""
+    t = tbl.dropna(subset=["ratio"])
+    if t.empty:
+        print("q1 summary: no usable metrics.")
+        return
+    constraint_dom = t.index[t["ratio"] < 1].tolist()
+    generator_dom = t.index[t["ratio"] >= 1].tolist()
+    print("\n--- Q1 verdict ---")
+    print(f"constraints dominate (ratio<1, generator well-behaved): "
+          f"{len(constraint_dom)}/{len(t)} metrics")
+    if constraint_dom:
+        print("   " + ", ".join(constraint_dom))
+    print(f"generator's residual freedom dominates (ratio>=1): "
+          f"{len(generator_dom)}/{len(t)} metrics")
+    if generator_dom:
+        print("   " + ", ".join(generator_dom))
+    med = t["ratio"].median()
+    verdict = ("constraints" if med < 1 else "the generator's residual freedom")
+    print(f"median ratio = {med:.2f}  ->  overall, {verdict} controls the "
+          f"emergent topology.")
+    if generator_dom:
+        print("   NB: metrics where the generator dominates are the ones whose "
+              "within-`cc` spread you must average over in Q2 before attributing "
+              "diffusion differences to the constraints.")
+
+
 
 # ---- quick self-test on the mock data ----
 if __name__ == "__main__":
 
-    ridgeline(df, cols=metrics, hhi_col="mix_werkschool_hhi_overall", agg_col="cc",
+    ridgeline(df, cols=metrics, hhi_col="mix_werkschool_homophily_raw", agg_col="cc",
               out_path="ridge_simple.png")
+    
+    # ---- Q1 run ------------------------------------------------------------
+    # spread="std" for the standard reading; switch to spread="iqr" for a
+    # heavy-tail-robust version (several metrics here are skew statistics).
+    q1_tbl = q1_spread_table(df, cols=metrics, group_col="cc", spread="std")
+    print("\n=== Q1: within- vs across-setting spread (per topological metric) ===")
+    print(q1_tbl.to_string(float_format=lambda x: f"{x:.4g}"))
+    q1_summary(q1_tbl)
+    plot_q1_spread(q1_tbl, out_path="q1_spread.png")
+

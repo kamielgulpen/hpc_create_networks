@@ -20,7 +20,7 @@ def create_communities(pops_path, links_path, scale, fraction_of_communities=Non
                        output_path='communities.json',
                        pop_column='n', src_suffix='_src', dst_suffix='_dst',
                        link_column='n', verbose=True,
-                       isolation_threshold=0.05, refine_swaps=300_000):
+                       isolation_threshold=0.05, refine_swaps=300_000, loss_goal = 0):
     from asnu.core.graph import NetworkXGraph
     from asnu.core.generate import init_nodes, _compute_maximum_num_links
 
@@ -31,7 +31,7 @@ def create_communities(pops_path, links_path, scale, fraction_of_communities=Non
                                verbose=verbose)
     number_of_communities = int(fraction_of_communities * G.graph.number_of_nodes()) if fraction_of_communities is not None else None
 
-    populate_communities_segregation(G, number_of_communities, refine_swaps,
+    loss = populate_communities_segregation(G, number_of_communities, refine_swaps, loss_goal=loss_goal,
                                      isolation_threshold=isolation_threshold)
 
     # ── Serialize to JSON ─────────────────────────────────────────────────
@@ -83,7 +83,7 @@ def create_communities(pops_path, links_path, scale, fraction_of_communities=Non
         json.dump(data, f)
 
     print(f"\nCommunity assignments saved to {output_path}")
-    return output_path
+    return output_path, loss
 
 def build_group_pair_to_communities_lookup(G, verbose=False):
     if verbose:
@@ -125,7 +125,7 @@ def build_group_pair_to_communities_lookup(G, verbose=False):
 
 
 def populate_communities_segregation(G, num_communities, refine_swaps,
-                                      isolation_threshold=0.05, seed=42):
+                                      isolation_threshold=0.05, loss_goal = 0, seed=42):
     """
     Segregation-driven hierarchical community assignment.
 
@@ -289,13 +289,14 @@ def populate_communities_segregation(G, num_communities, refine_swaps,
         refine_budget = {(int(k[0]), int(k[1])): int(v)
                          for k, v in G.maximum_num_links.items() if v > 0}
 
-        new_assignments = refine_communities_move(
+        new_assignments, loss = refine_communities_move(
             refine_assignments,
             refine_node_groups,
             refine_budget,
             n_groups,
             G.number_of_communities,
             refine_swaps,
+            loss_goal,
             1,
             42,
         )
@@ -329,6 +330,8 @@ def populate_communities_segregation(G, num_communities, refine_swaps,
 
     G.node_coordinates = node_coordinates
     print(f"\nSegregation-based assignment complete: {N} nodes -> {K_new} communities")
+
+    return loss
 
 
 def connect_all_within_communities(G, verbose=False):

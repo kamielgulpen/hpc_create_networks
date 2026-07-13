@@ -21,7 +21,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from SALib.sample import latin
 
 from asnu import generate, create_communities
 
@@ -33,18 +32,20 @@ from run_parallel_generate_network import N_SAMPLES
 # Configuration
 # =============================================================================
 
-POP = 861000
+
 SCALE           = 0.01
 RECIPROCITY_P   = 1
 N_SAMPLES       = N_SAMPLES
 RANDOM_SEED     = 42
 PREF_ATTACHMENT = 0  # held fixed
 BRIDGE_PROBABILITY = 0.0  # held fixed
+POP = 861000 * SCALE
 
 PROBLEM = {
-    'num_vars': 2,
-    'names':    ['n_communities', 'transitivity'],
+    'num_vars': 3,
+    'names':    ['n_communities', 'transitivity', 'optimize'],
     'bounds':   [[1/POP,   1.0],
+                 [0.0, 1.0],
                  [0.0, 1.0]],
 }
 
@@ -71,17 +72,16 @@ ALLOWED_EXCEPTIONS = {
     # 'geslacht',
 }
 
+REFERENCE_AGG_LEVEL = 'etngrp_geslacht_lft_oplniv'
 
-def get_or_create_samples() -> pd.DataFrame:
-    if data_lake.samples_exist():
-        return data_lake.read_samples()
-    samples = latin.sample(PROBLEM, N_SAMPLES, seed=RANDOM_SEED)
-    df = pd.DataFrame(samples, columns=PROBLEM['names'])
-    df.insert(0, 'sample_id', df.index)
-    data_lake.write_samples(df)
-    print(f"Wrote {len(df)} samples to the data lake")
-    return df
 
+def load_reference_losses() -> dict[tuple[int, str], float]:
+    path = data_lake.ROOT / 'refine_loss_reference' / f'{REFERENCE_AGG_LEVEL}.parquet'
+    if not path.exists():
+        return {}
+    df = pd.read_parquet(path)
+    return {(int(s), str(l)): float(v)
+            for s, l, v in zip(df['sample_id'], df['layer'], df['loss'])}
 
 def discover_aggregation_levels() -> list[str]:
     """Aggregation levels available in the lake, after the exclusion policy."""
@@ -175,10 +175,14 @@ def extract_nodes(G, community_map: dict[str, int] | None = None) -> pd.DataFram
 
 
 def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: str,
-                  pops_path: str, links_path: str) -> None:
+                  pops_path: str, links_path: str,
+                  loss_goal: float | None = 0.0) -> None:
 
     ncom = float(params['n_communities'])
     tr   = float(params['transitivity'])
+    opt = int(params['optimize'])
+
+    refine_swaps = 1000000 if opt else 1
 
     run_id     = f'sample_{sample_id:05d}'
     network_id = f'{run_id}__{agg_level_id}__{layer}'
@@ -194,13 +198,14 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
 
     try:
         t0 = time.perf_counter()
-        create_communities(
+        loss = create_communities(
             pops_path, links_path,
             scale=SCALE,
             fraction_of_communities=ncom,
             output_path=communities_path,
-            isolation_threshold = 0.8,
-            refine_swaps=100000
+            isolation_threshold=0.8,
+            refine_swaps=refine_swaps,
+            loss_goal=loss_goal
         )
 
         # Read the community assignment now, while the file still exists --
@@ -230,7 +235,7 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
     # The DuckDB catalog gets populated later by a single-process ingest
     # step, same pattern as everywhere else in this pipeline.
     data_lake.write_run(run_id, sampled_params={
-        'n_communities': ncom, 'transitivity': tr,
+        'n_communities': ncom, 'transitivity': tr, "optimize" : opt
     }, seed=RANDOM_SEED)
 
     data_lake.write_network_meta(
@@ -239,10 +244,18 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
         pref_attachment=PREF_ATTACHMENT, bridge_probability=BRIDGE_PROBABILITY,
     )
 
+    print( {
+        'n_nodes':          graph.graph.number_of_nodes(),
+        'n_edges':          graph.graph.number_of_edges(),
+        'gen_time_s':       elapsed,
+        'refine_loss':      loss,        # achieved
+        'refine_loss_goal': loss_goal
+    })
     data_lake.write_network_stats(network_id, {
-        'n_nodes':    graph.graph.number_of_nodes(),
-        'n_edges':    graph.graph.number_of_edges(),
-        'gen_time_s': elapsed,
+        'n_nodes':          graph.graph.number_of_nodes(),
+        'n_edges':          graph.graph.number_of_edges(),
+        'gen_time_s':       elapsed,
+        'refine_loss_goal': loss_goal
     })
 
     # NODES: keyed by network_id (per sample x agg_level x layer) -- the
@@ -273,7 +286,7 @@ def main():
             raise RuntimeError("Provide --task_id or set SLURM_ARRAY_TASK_ID")
         task_id = int(slurm_id)
 
-    samples = get_or_create_samples()
+    samples = data_lake.read_samples()
     if task_id >= len(samples):
         print(f"task_id {task_id} out of range ({len(samples)}). Exiting.")
         return
@@ -284,9 +297,12 @@ def main():
         return
 
     params = samples.iloc[task_id]
+    print(params)
 
     print(f"Sample {task_id}: comms={params['n_communities']} trans={params['transitivity']:.4f}")
     print(f"Using {len(agg_level_ids)} aggregation level(s): {agg_level_ids}")
+
+    reference_losses = load_reference_losses()
 
     with tempfile.TemporaryDirectory() as tmp_dir_str:
         tmp_dir = Path(tmp_dir_str)
@@ -297,10 +313,20 @@ def main():
                 print(f"  {agg_level_id}: no interaction layers found, skipping")
                 continue
             for layer in layers:
-                if layer not in ('werkschool'):
+                if layer not in ('werkschool',):   # note: real tuple, was a string
                     continue
+
+                loss_goal = 0
+                if agg_level_id != REFERENCE_AGG_LEVEL:
+                    loss_goal = reference_losses.get(task_id)
+                    if not loss_goal:
+                        print(f"  [{agg_level_id}] no reference loss for sample "
+                              f"{task_id}; running without a goal")
+                        loss_goal = 0
+
                 pops_path, links_path = materialize_csvs(agg_level_id, layer, tmp_dir)
-                generate_one(task_id, params, agg_level_id, layer, pops_path, links_path)
+                generate_one(task_id, params, agg_level_id, layer,
+                             pops_path, links_path, loss_goal=loss_goal)
 
 
     print(f"Sample {task_id} done.")

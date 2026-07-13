@@ -512,7 +512,8 @@ fn run_edge_creation(
     assignments, node_groups, budget,
     n_groups, n_communities,
     n_iterations = 100_000,
-    overshoot_penalty = 10.0,
+    loss_goal = 0.0,
+    overshoot_penalty = 1.0,
     seed = 42,
 ))]
 fn refine_communities_move<'py>(
@@ -522,10 +523,11 @@ fn refine_communities_move<'py>(
     budget: HashMap<(i64, i64), i64>,
     n_groups: usize,
     mut n_communities: usize, // Made mutable to allow growth
-    n_iterations: usize,
+    n_iterations: usize,    
+    loss_goal: f64,
     overshoot_penalty: f64,
     seed: u64,
-) -> PyResult<Bound<'py, PyArray1<i64>>> {
+)  -> PyResult<(Bound<'py, PyArray1<i64>>, f64)> {
     let assigns = assignments.as_array();
     let groups = node_groups.as_array();
     let n = assigns.len();
@@ -656,6 +658,10 @@ fn refine_communities_move<'py>(
             current[i] = c_new;
             current_loss += delta_loss;
             accepted += 1;
+            if current_loss <= loss_goal {
+            println!("Reached loss goal at iter {}: loss={:.2}", iter + 1, current_loss);
+            break;
+            }
         }
 
         if (iter + 1) % report_every == 0 {
@@ -664,7 +670,8 @@ fn refine_communities_move<'py>(
     }
 
     let result: Vec<i64> = current.iter().map(|&c| c as i64).collect();
-    Ok(PyArray1::from_owned_array_bound(py, Array1::from(result)))
+    let arr = PyArray1::from_owned_array_bound(py, Array1::from(result));
+    Ok((arr, current_loss))
 }
 
 

@@ -45,7 +45,7 @@ def run_task(task_id: int, script: str, python: str, logs_dir: Path) -> tuple[in
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tasks", type=int, default=N_SAMPLES)
-    parser.add_argument("--max_parallel", type=int, default=5)
+    parser.add_argument("--max_parallel", type=int, default=2)
     parser.add_argument("--script", default="generate_networks.py")
     parser.add_argument("--python", default=sys.executable)
     args = parser.parse_args()
