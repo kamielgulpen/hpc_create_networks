@@ -44,7 +44,7 @@ PROBLEM = {
 
 AGG_LEVEL = 'etngrp_geslacht_lft_oplniv'
 
-WRITE_EVERY = 25  # checkpoint the parquet every N completed tasks
+WRITE_EVERY = 1  # checkpoint the parquet every N completed tasks
 
 def get_or_create_samples() -> pd.DataFrame:
     if data_lake.samples_exist():
@@ -75,7 +75,7 @@ def loss_for_fraction(pops_path, links_path, fraction):
             output_path=tmp,
             isolation_threshold=ISOLATION_THRESHOLD,
             refine_swaps=REFINE_SWAPS,
-        ))
+        )[1])
     finally:
         os.unlink(tmp)
 
@@ -91,7 +91,7 @@ def _worker(task):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--workers', type=int, default=os.cpu_count())
+    parser.add_argument('--workers', type=int, default=2)
     args = parser.parse_args()
 
     samples = get_or_create_samples() 
@@ -125,12 +125,12 @@ def main():
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
             futures = [pool.submit(_worker, t) for t in tasks]
             for done, fut in enumerate(as_completed(futures), 1):
+   
                 r = fut.result()
                 rows.append(r)
                 print(f"  [{done}/{len(tasks)}] {r['layer']}  "
                       f"sample {r['sample_id']:05d}  loss={r['loss']:.6g}")
-                if done % WRITE_EVERY == 0:
-                    pd.DataFrame(rows).sort_values(['layer', 'sample_id']).to_parquet(out_path, index=False)
+                pd.DataFrame(rows).sort_values(['layer', 'sample_id']).to_parquet(out_path, index=False)
 
         pd.DataFrame(rows).sort_values(['layer', 'sample_id']).to_parquet(out_path, index=False)
 
