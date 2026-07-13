@@ -28,11 +28,10 @@ SCALE               = 0.01
 ISOLATION_THRESHOLD = 0.8
 REFINE_SWAPS        = 1000000
 
-SCALE           = 0.01
 N_SAMPLES       = N_SAMPLES
 RANDOM_SEED     = 42
-PREF_ATTACHMENT = 0  # held fixed
-BRIDGE_PROBABILITY = 0.0  # held fixed
+PREF_ATTACHMENT = 0 
+BRIDGE_PROBABILITY = 0.0  
 POP = 861000 * SCALE
 
 PROBLEM = {
@@ -96,6 +95,7 @@ def main():
     args = parser.parse_args()
 
     samples = get_or_create_samples() 
+    samples = samples[samples["optimize"] == 1]
     level_dir = data_lake.ROOT / 'aggregation_levels' / AGG_LEVEL
     layers = sorted(p.stem[len('interactions_'):]
                     for p in level_dir.glob('interactions_*.parquet'))
