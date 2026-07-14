@@ -6,13 +6,15 @@ reference loss curve the other aggregations can target.
 
 Loss depends only on fraction_of_communities + the pop/interaction data (not on
 transitivity, a generate() parameter), so reusing the LHS samples characterises
-it fully. Parallel across (layer, sample) pairs on one machine. Run alongside
+it fully. Parallel across (layer, sample) pairs on one machine; results are
+written to one parquet PER LAYER, with the layer in the filename. Run alongside
 data_lake.py.
 """
 
 import argparse
 import os
 import tempfile
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import pandas as pd
@@ -28,44 +30,44 @@ SCALE               = 0.01
 ISOLATION_THRESHOLD = 0.8
 REFINE_SWAPS        = 1000000
 
-N_SAMPLES       = N_SAMPLES
-RANDOM_SEED     = 42
-PREF_ATTACHMENT = 0 
-BRIDGE_PROBABILITY = 0.0  
-POP = 861000 * SCALE
+N_SAMPLES          = int(N_SAMPLES/2)
+RANDOM_SEED        = 42
+PREF_ATTACHMENT    = 0
+BRIDGE_PROBABILITY = 0.0
+POP                = 861000 * SCALE
 
 PROBLEM = {
     'num_vars': 2,
     'names':    ['n_communities', 'transitivity'],
-    'bounds':   [[1/POP,   1.0],
-                 [0.0, 1.0]
-                 ]
+    'bounds':   [[1 / POP, 1.0],
+                 [0.0,      1.0]],
 }
 
-AGG_LEVEL = 'etngrp_geslacht_lft_oplniv'
+AGG_LEVEL   = 'etngrp_geslacht_lft_oplniv'
+WRITE_EVERY = 1  # checkpoint the per-layer parquet every N completed tasks
 
-WRITE_EVERY = 1  # checkpoint the parquet every N completed tasks
 
 def get_or_create_samples() -> pd.DataFrame:
     if data_lake.samples_exist():
         return data_lake.read_samples()
     samples = latin.sample(PROBLEM, N_SAMPLES, seed=RANDOM_SEED)
-    print(samples)
     df = pd.DataFrame(samples, columns=PROBLEM['names'])
     df.insert(0, 'sample_id', df.index)
-    df.insert(3, 'optimize', 0) 
+    df.insert(3, 'optimize', 0)
+    print(df.shape)
     df1 = pd.DataFrame(samples, columns=PROBLEM['names'])
-    df1.insert(0, 'sample_id', df.index)
-    df1.insert(3, 'optimize', 1) 
-    df = pd.concat([df,df1])
+    df1.insert(0, 'sample_id', df1.index + df.shape[0])
+    df1.insert(3, 'optimize', 1)
+    df = pd.concat([df, df1])
     data_lake.write_samples(df)
     print(f"Wrote {len(df)} samples to the data lake")
     return df
 
 
 def loss_for_fraction(pops_path, links_path, fraction):
-    """One create_communities() call -> its loss. The community JSON is written
-    to a temp file we discard; only the returned loss matters."""
+    """One create_communities() call -> its loss. create_communities returns
+    (assignments, loss); we keep the loss. The community JSON is written to a
+    temp file we discard."""
     tmp = tempfile.NamedTemporaryFile(suffix='.json', delete=False).name
     try:
         return float(create_communities(
@@ -81,7 +83,7 @@ def loss_for_fraction(pops_path, links_path, fraction):
 
 
 def _worker(task):
-    """Runs in a child process. Pure compute -- no file writes to shared state.
+    """Runs in a child process. Pure compute -- no writes to shared state.
     CSVs were materialized once by the parent; we only read the paths."""
     sample_id, layer, fraction, pops_path, links_path = task
     loss = loss_for_fraction(pops_path, links_path, fraction)
@@ -94,14 +96,24 @@ def main():
     parser.add_argument('--workers', type=int, default=2)
     args = parser.parse_args()
 
-    samples = get_or_create_samples() 
-    samples = samples[samples["optimize"] == 1]
+    samples = get_or_create_samples()
+    samples = samples[samples['optimize'] == 1] # Use only optimized samples to optimize community structure
+
     level_dir = data_lake.ROOT / 'aggregation_levels' / AGG_LEVEL
     layers = sorted(p.stem[len('interactions_'):]
                     for p in level_dir.glob('interactions_*.parquet'))
 
-    out_path = data_lake.ROOT / 'refine_loss_reference' / f'{AGG_LEVEL}.parquet'
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_dir = data_lake.ROOT / 'refine_loss_reference'
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def layer_path(layer):
+        # One file per layer, layer encoded in the name.
+        return out_dir / f'{AGG_LEVEL}__{layer}.parquet'
+
+    def flush(layer, layer_rows):
+        (pd.DataFrame(layer_rows)
+           .sort_values('sample_id')
+           .to_parquet(layer_path(layer), index=False))
 
     # Materialize CSVs ONCE, into a temp dir that outlives the whole pool. The
     # pop file is shared; one links file per layer. Workers just read paths.
@@ -120,21 +132,29 @@ def main():
         print(f"{len(tasks)} tasks ({len(layers)} layers x {len(samples)} samples), "
               f"{args.workers} workers")
 
-        rows = []
-        # Parent owns all parquet writes -- workers never touch the output file.
+        # Results grouped per layer so each writes to its own file. as_completed
+        # returns out of order, hence the dict keyed by layer.
+        rows_by_layer = defaultdict(list)
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
             futures = [pool.submit(_worker, t) for t in tasks]
             for done, fut in enumerate(as_completed(futures), 1):
-   
-                r = fut.result()
-                rows.append(r)
+                try:
+                    r = fut.result()
+                except Exception as e:
+                    print(f"  [{done}/{len(tasks)}] FAILED: {e!r}")
+                    continue
+                rows_by_layer[r['layer']].append(r)
                 print(f"  [{done}/{len(tasks)}] {r['layer']}  "
                       f"sample {r['sample_id']:05d}  loss={r['loss']:.6g}")
-                pd.DataFrame(rows).sort_values(['layer', 'sample_id']).to_parquet(out_path, index=False)
+                if done % WRITE_EVERY == 0:
+                    flush(r['layer'], rows_by_layer[r['layer']])
 
-        pd.DataFrame(rows).sort_values(['layer', 'sample_id']).to_parquet(out_path, index=False)
+        # Final flush -- every layer, once.
+        for layer, layer_rows in rows_by_layer.items():
+            flush(layer, layer_rows)
 
-    print(f"\nDone. {len(rows)} rows -> {out_path}")
+    total = sum(len(v) for v in rows_by_layer.values())
+    print(f"\nDone. {total} rows across {len(rows_by_layer)} layer file(s) -> {out_dir}")
 
 
 if __name__ == '__main__':

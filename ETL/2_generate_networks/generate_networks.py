@@ -26,8 +26,6 @@ from asnu import generate, create_communities
 
 import data_lake
 
-from run_parallel_generate_network import N_SAMPLES
-
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -35,11 +33,9 @@ from run_parallel_generate_network import N_SAMPLES
 
 SCALE           = 0.01
 RECIPROCITY_P   = 1
-N_SAMPLES       = N_SAMPLES *2
 RANDOM_SEED     = 42
-PREF_ATTACHMENT = 0  # held fixed
-BRIDGE_PROBABILITY = 0.0  # held fixed
-POP = 861000 * SCALE
+PREF_ATTACHMENT = 0
+BRIDGE_PROBABILITY = 0.0
 
 
 # Same inclusion/exclusion policy as the original discover_enriched_pairs(),
@@ -69,12 +65,24 @@ REFERENCE_AGG_LEVEL = 'etngrp_geslacht_lft_oplniv'
 
 
 def load_reference_losses() -> dict[tuple[int, str], float]:
-    path = data_lake.ROOT / 'refine_loss_reference' / f'{REFERENCE_AGG_LEVEL}.parquet'
-    if not path.exists():
+    """
+    {(sample_id, layer): loss} from the reference sweep (sweep_refine_loss.py).
+    That sweep writes ONE parquet per layer, named
+    f'{REFERENCE_AGG_LEVEL}__{layer}.parquet', each with sample_id / layer /
+    loss columns. We glob them all and key on (sample_id, layer). Returns {}
+    if the sweep hasn't been run yet.
+    """
+    ref_dir = data_lake.ROOT / 'refine_loss_reference'
+    if not ref_dir.exists():
         return {}
-    df = pd.read_parquet(path)
-    return {(int(s), str(l)): float(v)
-            for s, l, v in zip(df['sample_id'], df['layer'], df['loss'])}
+
+    losses: dict[tuple[int, str], float] = {}
+    for path in sorted(ref_dir.glob(f'{REFERENCE_AGG_LEVEL}__*.parquet')):
+        df = pd.read_parquet(path)
+        for s, l, v in zip(df['sample_id'], df['layer'], df['loss']):
+            losses[(int(s), str(l))] = float(v)
+    return losses
+
 
 def discover_aggregation_levels() -> list[str]:
     """Aggregation levels available in the lake, after the exclusion policy."""
@@ -169,13 +177,19 @@ def extract_nodes(G, community_map: dict[str, int] | None = None) -> pd.DataFram
 
 def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: str,
                   pops_path: str, links_path: str,
-                  loss_goal: float | None = 0.0) -> None:
+                  loss_goal: float | None = None) -> None:
 
     ncom = float(params['n_communities'])
     tr   = float(params['transitivity'])
-    opt = int(params['optimize'])
+    opt  = int(params['optimize'])
 
+    print(ncom, tr, opt)
     refine_swaps = 1000000 if opt else 1
+
+    # create_communities early-stops once loss <= loss_goal. -inf disables the
+    # goal entirely (runs the full refine_swaps); it's what we pass when no
+    # reference loss exists for this (sample, layer).
+    cc_goal = loss_goal if loss_goal is not None else float('-inf')
 
     run_id     = f'sample_{sample_id:05d}'
     network_id = f'{run_id}__{agg_level_id}__{layer}'
@@ -191,6 +205,7 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
 
     try:
         t0 = time.perf_counter()
+        # create_communities returns (assignments, loss); we only need the loss.
         loss = create_communities(
             pops_path, links_path,
             scale=SCALE,
@@ -198,8 +213,8 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
             output_path=communities_path,
             isolation_threshold=0.8,
             refine_swaps=refine_swaps,
-            loss_goal=loss_goal
-        )
+            loss_goal=cc_goal,
+        )[1]
 
         # Read the community assignment now, while the file still exists --
         # it gets deleted in `finally` below, before extract_nodes() runs.
@@ -228,7 +243,7 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
     # The DuckDB catalog gets populated later by a single-process ingest
     # step, same pattern as everywhere else in this pipeline.
     data_lake.write_run(run_id, sampled_params={
-        'n_communities': ncom, 'transitivity': tr, "optimize" : opt
+        'n_communities': ncom, 'transitivity': tr, 'optimize': opt,
     }, seed=RANDOM_SEED)
 
     data_lake.write_network_meta(
@@ -237,18 +252,12 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
         pref_attachment=PREF_ATTACHMENT, bridge_probability=BRIDGE_PROBABILITY,
     )
 
-    print( {
-        'n_nodes':          graph.graph.number_of_nodes(),
-        'n_edges':          graph.graph.number_of_edges(),
-        'gen_time_s':       elapsed,
-        'refine_loss':      loss,        # achieved
-        'refine_loss_goal': loss_goal
-    })
     data_lake.write_network_stats(network_id, {
         'n_nodes':          graph.graph.number_of_nodes(),
         'n_edges':          graph.graph.number_of_edges(),
         'gen_time_s':       elapsed,
-        'refine_loss_goal': loss_goal
+        'refine_loss':      loss,        # achieved
+        'refine_loss_goal': loss_goal,   # None when no goal was applied
     })
 
     # NODES: keyed by network_id (per sample x agg_level x layer) -- the
@@ -264,7 +273,8 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
         data_lake.write_nodes(network_id, "network_id", nodes_df)
 
     print(f"  [{network_id}] {graph.graph.number_of_nodes()} nodes, "
-          f"{graph.graph.number_of_edges()} edges, {elapsed:.1f}s")
+          f"{graph.graph.number_of_edges()} edges, {elapsed:.1f}s "
+          f"(loss={loss:.6g}, goal={loss_goal})")
 
 
 def main():
@@ -290,9 +300,13 @@ def main():
         return
 
     params = samples.iloc[task_id]
-    print(params)
+    # task_id positions into the (optimize=0 | optimize=1) concat, so it is NOT
+    # the sample_id. The reference sweep is keyed on the real sample_id, so use
+    # that for the loss lookup.
+    sample_id = int(params['sample_id'])
 
-    print(f"Sample {task_id}: comms={params['n_communities']} trans={params['transitivity']:.4f}")
+    print(f"Task {task_id} -> sample {sample_id}: comms={params['n_communities']} "
+          f"trans={params['transitivity']:.4f} optimize={int(params['optimize'])}")
     print(f"Using {len(agg_level_ids)} aggregation level(s): {agg_level_ids}")
 
     reference_losses = load_reference_losses()
@@ -305,22 +319,19 @@ def main():
             if not layers:
                 print(f"  {agg_level_id}: no interaction layers found, skipping")
                 continue
+
             for layer in layers:
-                if layer not in ('werkschool',):   # note: real tuple, was a string
+                if layer in ('huishouden',):
                     continue
 
-                loss_goal = 0
-                if agg_level_id != REFERENCE_AGG_LEVEL:
-                    loss_goal = reference_losses.get(task_id)
-                    if not loss_goal:
-                        print(f"  [{agg_level_id}] no reference loss for sample "
-                              f"{task_id}; running without a goal")
-                        loss_goal = 0
+                loss_goal = reference_losses.get((sample_id, layer))
+                if loss_goal is None:
+                    print(f"  [{agg_level_id}/{layer}] no reference loss for "
+                          f"sample {sample_id}; running without a goal")
 
                 pops_path, links_path = materialize_csvs(agg_level_id, layer, tmp_dir)
                 generate_one(task_id, params, agg_level_id, layer,
                              pops_path, links_path, loss_goal=loss_goal)
-
 
     print(f"Sample {task_id} done.")
 
