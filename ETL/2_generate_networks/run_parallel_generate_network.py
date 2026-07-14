@@ -26,7 +26,7 @@ from pathlib import Path
 
 import data_lake
 
-N_SAMPLES = 300
+N_SAMPLES = 600
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
