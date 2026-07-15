@@ -35,7 +35,7 @@ OUT_FILENAME = "ignition_probability.parquet"
 
 
 def compute_ignition_probability(ignition_threshold_fraction: float = 0.5,
-                                  batch_size: int = 50) -> pl.DataFrame:
+                                  batch_size: int = 10) -> pl.DataFrame:
     """
     Per (network, threshold): fraction of simulations that "ignited" (final
     adoption fraction >= ignition_threshold_fraction), plus
@@ -110,11 +110,11 @@ def compute_ignition_probability(ignition_threshold_fraction: float = 0.5,
         .agg([
             pl.len().alias("n_simulations"),
             pl.col("total_nodes").first(),
-            (pl.col("n_infected") >= pl.col("total_nodes") * 0.5)
+            (pl.col("final_fraction") >= 0.5)
                 .mean().alias("ignition_probability_50"),
-            (pl.col("n_infected") >= pl.col("total_nodes") * 0.3)
+            (pl.col("final_fraction") >= 0.3)
             .mean().alias("ignition_probability_30"),
-            (pl.col("n_infected") >= pl.col("total_nodes") * 0.1)
+            (pl.col("final_fraction") >= 0.1)
             .mean().alias("ignition_probability_10"),
             (pl.col("n_infected") == pl.col("total_nodes") * 0.9)
                 .mean().alias("full_cascade_probability"),
