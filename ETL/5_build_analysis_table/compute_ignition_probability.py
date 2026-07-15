@@ -115,7 +115,7 @@ def compute_ignition_probability(ignition_threshold_fraction: float = 0.5,
             (pl.col("final_fraction") >= pl.col("total_nodes") * 0.3)
             .mean().alias("ignition_probability_30"),
             (pl.col("final_fraction") >= pl.col("total_nodes") * 0.1)
-            .mean().alias("ignition_probability_10")
+            .mean().alias("ignition_probability_10"),
             (pl.col("n_infected") == pl.col("total_nodes") * 0.9)
                 .mean().alias("full_cascade_probability"),
             pl.col("final_fraction").mean().alias("mean_final_adoption_fraction"),
