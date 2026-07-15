@@ -6,7 +6,7 @@ Functions
 build_group_pair_to_communities_lookup : Create lookup for group pairs to communities
 connect_all_within_communities : Create fully connected subgraphs within communities
 fill_unfulfilled_group_pairs : Complete group pairs that didn't reach target edge count
-populate_communities_segregation : Assign nodes to communities (segregation mode)
+populate_communities : Assign nodes to communities
 load_communities : Load community assignments from JSON file
 """
 import json
@@ -20,7 +20,7 @@ def create_communities(pops_path, links_path, scale, fraction_of_communities=Non
                        output_path='communities.json',
                        pop_column='n', src_suffix='_src', dst_suffix='_dst',
                        link_column='n', verbose=True,
-                       isolation_threshold=0.05, refine_swaps=300_000, loss_goal = 0):
+                       refine_swaps=300_000, loss_goal=0):
     from asnu.core.graph import NetworkXGraph
     from asnu.core.generate import init_nodes, _compute_maximum_num_links
 
@@ -31,41 +31,11 @@ def create_communities(pops_path, links_path, scale, fraction_of_communities=Non
                                verbose=verbose)
     number_of_communities = int(fraction_of_communities * G.graph.number_of_nodes()) if fraction_of_communities is not None else None
 
-    loss = populate_communities_segregation(G, number_of_communities, refine_swaps, loss_goal=loss_goal,
-                                     isolation_threshold=isolation_threshold)
+    loss = populate_communities(G, number_of_communities, refine_swaps, loss_goal=loss_goal)
 
     # ── Serialize to JSON ─────────────────────────────────────────────────
-    _pm = G.probability_matrix
-    _n = _pm.shape[0] if hasattr(_pm, 'shape') else 0
-
-    if _n == 0:
-        _pm_serial = {'sparse': True, 'shape': [0, 0], 'rows': [], 'cols': [], 'vals': []}
-    elif _n > 500:
-        import scipy.sparse as _sp
-        if _sp.issparse(_pm):
-            _coo = _pm.tocoo()
-            _pm_serial = {
-                'sparse': True,
-                'shape': [int(_n), int(_n)],
-                'rows': _coo.row.tolist(),
-                'cols': _coo.col.tolist(),
-                'vals': _coo.data.tolist(),
-            }
-        else:
-            _nz = np.argwhere(_pm > 0)
-            _pm_serial = {
-                'sparse': True,
-                'shape': [int(_n), int(_n)],
-                'rows': _nz[:, 0].tolist(),
-                'cols': _nz[:, 1].tolist(),
-                'vals': _pm[_nz[:, 0], _nz[:, 1]].tolist(),
-            }
-    else:
-        _pm_serial = _pm.tolist()
-
     data = {
         'number_of_communities': int(G.number_of_communities),
-        'probability_matrix': _pm_serial,
         'nodes_to_communities': {
             str(k): int(v) for k, v in G.nodes_to_communities.items()
         },
@@ -124,57 +94,19 @@ def build_group_pair_to_communities_lookup(G, verbose=False):
     return group_pair_to_communities
 
 
-def populate_communities_segregation(G, num_communities, refine_swaps,
-                                      isolation_threshold=0.05, loss_goal = 0, seed=42):
+def populate_communities(G, num_communities, refine_swaps, loss_goal=0, seed=42):
     """
-    Segregation-driven hierarchical community assignment.
+    Assign nodes to communities, then refine.
 
-    Measures isolation per characteristic from the edge budget, then partitions
-    communities hierarchically: the most segregated characteristic anchors the
-    primary split, the second most segregated subdivides within that.
+    Nodes from each group are shuffled and distributed proportionally across all
+    communities (favoring those with the most headroom), then handed to the Rust
+    refinement pass to minimize the edge-budget loss.
     """
     n_groups = len(G.group_ids)
     rng = np.random.default_rng(seed)
     sorted_groups = sorted(int(g) for g in G.group_ids)
     group_nodes_map = {g: list(G.group_to_nodes.get(g, [])) for g in sorted_groups}
     N = G.graph.number_of_nodes()
-
-    all_chars = set()
-    for gid in sorted_groups:
-        all_chars.update(G.group_to_attrs.get(gid, {}).keys())
-    all_chars = sorted(all_chars)
-
-    char_isolation = {}
-    for char in all_chars:
-        val_to_groups = {}
-        for gid in sorted_groups:
-            v = G.group_to_attrs.get(gid, {}).get(char)
-            if v is not None:
-                val_to_groups.setdefault(v, []).append(gid)
-
-        if len(val_to_groups) <= 1:
-            char_isolation[char] = 0.0
-            continue
-
-        isolations = []
-        for v, vgroups in val_to_groups.items():
-            vset = set(vgroups)
-            n_v = sum(len(group_nodes_map[g]) for g in vset)
-            if n_v == 0 or N == 0:
-                continue
-            intra = sum(G.maximum_num_links.get((g, h), 0) for g in vset for h in vset)
-            total_out = sum(G.maximum_num_links.get((g, h), 0) for g in vset for h in sorted_groups)
-            I_v = (intra / total_out - n_v / N) if total_out > 0 else 0.0
-            isolations.append(I_v)
-        char_isolation[char] = float(np.mean(isolations)) if isolations else 0.0
-
-    meaningful = sorted(
-        [(c, iso) for c, iso in char_isolation.items() if iso >= isolation_threshold],
-        key=lambda x: x[1], reverse=True
-    )
-    print(f"  Isolation scores: { {c: f'{iso:.3f}' for c, iso in char_isolation.items()} }")
-    print(f"  Meaningful characteristics (>={isolation_threshold}): {[(c, f'{iso:.3f}') for c, iso in meaningful]}")
-
     K = num_communities
 
     def _proportional_alloc(weights, total):
@@ -197,57 +129,6 @@ def populate_communities_segregation(G, num_communities, refine_swaps,
             remainder -= 1
         return sizes
 
-    if not meaningful:
-        group_comms = {gid: list(range(K)) for gid in sorted_groups}
-
-    elif len(meaningful) == 1:
-        char1, _ = meaningful[0]
-        val_to_groups = {}
-        for gid in sorted_groups:
-            v = G.group_to_attrs.get(gid, {}).get(char1)
-            val_to_groups.setdefault(v, []).append(gid)
-        vals1 = sorted(val_to_groups.keys(), key=str)
-
-        pops = [sum(len(group_nodes_map[g]) for g in val_to_groups[v]) for v in vals1]
-        sizes = _proportional_alloc(pops, K)
-
-        val1_comms = {}
-        start = 0
-        for v, size in zip(vals1, sizes):
-            val1_comms[v] = list(range(start, start + size))
-            start += size
-
-        group_comms = {}
-        for gid in sorted_groups:
-            v1 = G.group_to_attrs.get(gid, {}).get(char1)
-            group_comms[gid] = val1_comms.get(v1, [])
-
-    else:
-        char1, _ = meaningful[0]
-        char2, _ = meaningful[1]
-
-        pair_pop = {}
-        for gid in sorted_groups:
-            v1 = G.group_to_attrs.get(gid, {}).get(char1)
-            v2 = G.group_to_attrs.get(gid, {}).get(char2)
-            pair_pop[(v1, v2)] = pair_pop.get((v1, v2), 0) + len(group_nodes_map[gid])
-
-        pairs = sorted(pair_pop.keys(), key=lambda p: (str(p[0]), str(p[1])))
-        pops = [pair_pop[p] for p in pairs]
-        sizes = _proportional_alloc(pops, K)
-
-        block_comms = {}
-        start = 0
-        for pair, size in zip(pairs, sizes):
-            block_comms[pair] = list(range(start, start + size))
-            start += size
-
-        group_comms = {}
-        for gid in sorted_groups:
-            v1 = G.group_to_attrs.get(gid, {}).get(char1)
-            v2 = G.group_to_attrs.get(gid, {}).get(char2)
-            group_comms[gid] = block_comms.get((v1, v2), [])
-
     G.number_of_communities = K
     target = max(1, N // K)
     community_count = np.zeros(K, dtype=np.int64)
@@ -257,7 +138,7 @@ def populate_communities_segregation(G, num_communities, refine_swaps,
         if len(nodes) == 0:
             continue
         rng.shuffle(nodes)
-        chosen = group_comms.get(gid, list(range(K))) or list(range(K))
+        chosen = list(range(K))
 
         headroom = np.array([max(0, target - community_count[c]) for c in chosen], dtype=np.float64)
         if headroom.sum() == 0:
@@ -317,6 +198,7 @@ def populate_communities_segregation(G, num_communities, refine_swaps,
     except ImportError:
         print("  refine_communities_move not available; skipping refinement.")
         new_assignments = refine_assignments  # fall back to pre-refinement assignments
+        loss = None
 
     K_new = int(new_assignments.max()) + 1
     G.number_of_communities = K_new
@@ -329,7 +211,7 @@ def populate_communities_segregation(G, num_communities, refine_swaps,
         node_coordinates[node_int] = (theta_c) % 1.0
 
     G.node_coordinates = node_coordinates
-    print(f"\nSegregation-based assignment complete: {N} nodes -> {K_new} communities")
+    print(f"\nAssignment complete: {N} nodes -> {K_new} communities")
 
     return loss
 
@@ -530,24 +412,6 @@ def load_communities(G, community_file_path):
         data = json.load(f)
 
     G.number_of_communities = data['number_of_communities']
-    _pm_data = data['probability_matrix']
-    if isinstance(_pm_data, dict) and _pm_data.get('sparse'):
-        _n = _pm_data['shape'][0]
-        if _n == 0:
-            G.probability_matrix = np.zeros((0, 0), dtype=np.float64)
-        elif _n > 5000:
-            from scipy.sparse import csr_matrix as _csr
-            G.probability_matrix = _csr(
-                (_pm_data['vals'], (_pm_data['rows'], _pm_data['cols'])),
-                shape=(_n, _n), dtype=np.float64
-            )
-        else:
-            _pm_arr = np.zeros((_n, _n), dtype=np.float64)
-            for r, c, v in zip(_pm_data['rows'], _pm_data['cols'], _pm_data['vals']):
-                _pm_arr[r, c] = v
-            G.probability_matrix = _pm_arr
-    else:
-        G.probability_matrix = np.array(_pm_data)
 
     graph_nodes = set(G.graph.nodes)
     G.nodes_to_communities = {}

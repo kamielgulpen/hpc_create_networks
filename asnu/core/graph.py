@@ -80,7 +80,6 @@ class NetworkXGraph:
         self.communities_to_groups = {}
         self.existing_num_links = {}
         self.maximum_num_links = {}
-        self.probability_matrix = np.zeros((0, 0))
         self.number_of_communities = 0
 
         # Global popularity pool for preferential attachment with memory
@@ -238,4 +237,3 @@ class NetworkXGraph:
             num_nodes=self.graph.number_of_nodes(),
             directed=self.graph.is_directed()
         )
-

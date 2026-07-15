@@ -1,8 +1,6 @@
 """ This module contains utility functions used during graph generation. """
 
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
 
 def stratified_allocate(items, scale):
     """
@@ -42,12 +40,6 @@ def stratified_allocate(items, scale):
 
     return allocations
 
-def _short_label(G, gid):
-    attrs = G.group_to_attrs.get(gid) or G.group_to_attrs.get(str(gid))
-    if not attrs:
-        return str(gid)
-    return ', '.join(str(v) for k, v in attrs.items() if k != 'n')
-
 
 def find_nodes(G, **attrs):
     """
@@ -85,132 +77,6 @@ def read_file(path):
     else:
         raise ValueError("Unsupported file format: {}".format(path))
 
-def check_group_interactions(G, print_report=True):
-    """
-    Validate that actual edge counts between groups match the generation targets.
-
-    Counts directed edges between every (src_group, dst_group) pair in the
-    generated network and compares them to ``G.maximum_num_links``.
-
-    Parameters
-    ----------
-    G : NetworkXGraph
-        The generated graph, with ``nodes_to_group`` and ``maximum_num_links``
-        populated.
-    print_report : bool, optional
-        If True (default), prints a formatted table of results.
-
-    Returns
-    -------
-    dict
-        Keys are (src_group, dst_group) tuples. Values are dicts with:
-        ``actual``, ``target``, ``ratio`` (actual/target), ``diff`` (actual-target).
-        Pairs with no target and no actual edges are omitted.
-    """
-    # Count actual edges per (src_group, dst_group)
-    actual = {}
-    for src, dst in G.graph.edges():
-        sg = G.nodes_to_group.get(src)
-        dg = G.nodes_to_group.get(dst)
-        if sg is None or dg is None:
-            continue
-        key = (sg, dg)
-        actual[key] = actual.get(key, 0) + 1
-
-    # Union of all pairs that have a target or actual edges
-    all_pairs = set(G.maximum_num_links.keys()) | set(actual.keys())
-
-    results = {}
-    for pair in sorted(all_pairs):
-        tgt = G.maximum_num_links.get(pair, 0)
-        act = actual.get(pair, 0)
-        results[pair] = {
-            'actual': act,
-            'target': tgt,
-            'diff': act - tgt,
-            'ratio': (act / tgt) if tgt > 0 else float('inf'),
-        }
-
-    return results
-
-
-def plot_group_interactions(results, G, scatter_path='group_scatter.png', bar_path='group_bar.png'):
-    """
-    Save two diagnostic plots for the output of check_group_interactions.
-
-    Parameters
-    ----------
-    results : dict
-        Return value of check_group_interactions.
-    G : FileBasedGraph
-        The generated graph (used to resolve group labels).
-    scatter_path : str
-        File path for the actual-vs-target scatter plot.
-    bar_path : str
-        File path for the per-pair ratio bar chart.
-    """
-    from matplotlib.figure import Figure
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
-
-    pairs = sorted(results.keys())
-    targets = np.array([results[p]['target'] for p in pairs])
-    actuals = np.array([results[p]['actual'] for p in pairs])
-
-    # --- Scatter: actual vs target ---
-    fig1 = Figure(figsize=(6, 6))
-    FigureCanvasAgg(fig1)
-    ax1 = fig1.add_subplot(111)
-    ax1.scatter(targets, actuals, alpha=0.6, s=20)
-    lim = max(targets.max(), actuals.max()) * 1.05
-    ax1.plot([0, lim], [0, lim], 'r--', linewidth=1, label='actual = target')
-    ax1.set_xlabel('Target')
-    ax1.set_ylabel('Actual')
-    ax1.set_title('Group pair edge counts: actual vs target')
-    ax1.legend()
-    fig1.tight_layout()
-    fig1.savefig(scatter_path, dpi=150)
-    print(f"Saved scatter plot to {scatter_path}")
-
-    # --- Heatmap: ratio per (src_group, dst_group) ---
-    visible_pairs = {p: r for p, r in results.items() if r['target'] > 0 or r['actual'] > 0}
-    src_groups = sorted({p[0] for p in visible_pairs})
-    dst_groups = sorted({p[1] for p in visible_pairs})
-    src_idx = {g: i for i, g in enumerate(src_groups)}
-    dst_idx = {g: i for i, g in enumerate(dst_groups)}
-
-    grid = np.full((len(src_groups), len(dst_groups)), np.nan)
-    for (sg, dg), r in visible_pairs.items():
-        ratio = r['ratio'] if r['target'] > 0 else 2.0
-        grid[src_idx[sg], dst_idx[dg]] = ratio
-
-    src_labels = [_short_label(G, g) for g in src_groups]
-    dst_labels = [_short_label(G, g) for g in dst_groups]
-
-    cell_size = 0.4
-    fig_w = min(max(5, len(dst_groups) * cell_size + 3), 30)
-    fig_h = min(max(4, len(src_groups) * cell_size + 2), 30)
-    fig2 = Figure(figsize=(fig_w, fig_h))
-    FigureCanvasAgg(fig2)
-    ax2 = fig2.add_subplot(111)
-
-    import matplotlib.colors as mcolors
-    cmap = plt.cm.RdYlGn
-    norm = mcolors.TwoSlopeNorm(vmin=0, vcenter=1.0, vmax=2.0)
-    im = ax2.imshow(grid, aspect='auto', cmap=cmap, norm=norm)
-    fig2.colorbar(im, ax=ax2, label='actual / target', shrink=0.6)
-
-    fs = max(5, min(9, int(200 / max(len(src_groups), len(dst_groups)))))
-    ax2.set_xticks(np.arange(len(dst_groups)))
-    ax2.set_xticklabels(dst_labels, rotation=90, fontsize=fs)
-    ax2.set_yticks(np.arange(len(src_groups)))
-    ax2.set_yticklabels(src_labels, fontsize=fs)
-    ax2.set_xlabel('Destination group')
-    ax2.set_ylabel('Source group')
-    ax2.set_title('Group pair edge ratio heatmap (green=OK, red=over, white=under)')
-    fig2.tight_layout()
-    fig2.savefig(bar_path, dpi=100)
-    print(f"Saved heatmap to {bar_path}")
-
 
 def desc_groups(pops_path, pop_column = 'n'):
     """
@@ -241,4 +107,3 @@ def desc_groups(pops_path, pop_column = 'n'):
     }
 
     return group_populations, characteristic_cols
-

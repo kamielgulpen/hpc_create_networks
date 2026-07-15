@@ -12,7 +12,6 @@ approaches for graphs that fit in memory.
 Functions
 ---------
 init_nodes : Initialize nodes in the graph from population data
-init_links : Initialize edges in the graph from interaction data
 generate : Main function to generate a complete network
 
 Examples
@@ -25,7 +24,7 @@ import os
 import shutil
 from collections import defaultdict
 
-from asnu.core.utils import (find_nodes, read_file, desc_groups, stratified_allocate)
+from asnu.core.utils import (read_file, desc_groups, stratified_allocate)
 from asnu.core.grn import establish_links, establish_links_phase_b
 from asnu.core.graph import NetworkXGraph
 from asnu.core.community import (
@@ -184,33 +183,7 @@ def _setup_no_community_structure(G):
     This allows the edge creation code to work unchanged when no community
     structure is desired — all nodes are placed in community 0.
     """
-    import numpy as np
-    from scipy.sparse import csr_matrix as _csr
-
-    n_groups = len(G.group_ids)
     G.number_of_communities = 1
-
-    # Build probability matrix (normalized affinity) even without communities.
-    if G.maximum_num_links:
-        triples = [(i, j, v) for (i, j), v in G.maximum_num_links.items() if v > 0]
-        rows_idx, cols_idx, vals = zip(*triples) if triples else ([], [], [])
-    else:
-        rows_idx, cols_idx, vals = [], [], []
-
-    if vals:
-        affinity_sp = _csr((list(vals), (list(rows_idx), list(cols_idx))),
-                           shape=(n_groups, n_groups), dtype=float)
-    else:
-        affinity_sp = _csr((n_groups, n_groups), dtype=float)
-
-    epsilon = 1e-5
-    row_sums = np.asarray(affinity_sp.sum(axis=1)).flatten() + epsilon
-    # Keep sparse if very large; todense() on a 70k×70k matrix would allocate 39 GB.
-    if n_groups > 500:
-        G.probability_matrix = np.zeros((0, 0))  # unused in 1-community edge creation
-    else:
-        G.probability_matrix = np.asarray(
-            affinity_sp.multiply(1.0 / row_sums[:, np.newaxis]).todense())
 
     # Single community (0) contains all groups and all nodes.
     G.communities_to_groups[0] = list(G.group_ids)
