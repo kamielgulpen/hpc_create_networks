@@ -26,7 +26,7 @@ from pathlib import Path
 
 import data_lake
 
-N_SAMPLES = 2
+N_SAMPLES = 600
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 def run_task(task_id: int, script: str, python: str, logs_dir: Path) -> tuple[int, int]:
