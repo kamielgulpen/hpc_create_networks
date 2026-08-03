@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from asnu import generate, create_communities
+from asnu import generate, create_communities, clone_communities
 
 import data_lake
 
@@ -31,11 +31,20 @@ import data_lake
 # =============================================================================
 
 
-SCALE           = 0.01
+SCALE           = float(os.environ.get("PIPELINE_SCALE", "0.01"))
 RECIPROCITY_P   = 1
 RANDOM_SEED     = 42
 PREF_ATTACHMENT = 0
 BRIDGE_PROBABILITY = 0.0
+
+# Community CLONING switch (opt-in, unset = original behaviour).
+# When CLONE_FROM_SCALE is set (e.g. "0.01"), generate_one() reuses each
+# network's community structure from that smaller-scale lake -- cloning it up
+# to SCALE via asnu.clone_communities -- instead of running the expensive
+# create_communities() refinement. If a per-network source is missing it falls
+# back to create_communities() for that network, so a partial small-scale run
+# never silently drops networks. Unset -> create_communities() as before.
+CLONE_FROM_SCALE = os.environ.get("CLONE_FROM_SCALE")  # str like "0.01" or None
 
 
 # Same inclusion/exclusion policy as the original discover_enriched_pairs(),
@@ -175,6 +184,32 @@ def extract_nodes(G, community_map: dict[str, int] | None = None) -> pd.DataFram
     return pd.DataFrame(records)
 
 
+def clone_source_nodes_path(network_id: str) -> Path | None:
+    """
+    Locate the small-scale nodes.parquet to clone this network's community
+    structure from, when CLONE_FROM_SCALE is set.
+
+    data_lake.ROOT already encodes the CURRENT scale (…/data_lake_scale{SCALE}).
+    The source lake is the sibling …/data_lake_scale{CLONE_FROM_SCALE} with the
+    SAME network_id -- because network_id (sample__agg__layer) is scale-free, the
+    small- and large-scale runs share it one-to-one. Returns the path if it
+    exists, else None (caller falls back to create_communities()).
+    """
+    if not CLONE_FROM_SCALE:
+        return None
+    root = data_lake.ROOT
+    src_root = root.with_name(f"data_lake_scale{CLONE_FROM_SCALE}")
+    if src_root == root:
+        # Current lake isn't scale-suffixed (PIPELINE_SCALE unset). Be explicit
+        # rather than clone from ourselves.
+        print(f"  [clone] WARNING: data lake root {root.name!r} is not "
+              f"scale-suffixed; cannot locate a distinct source lake. "
+              f"Set PIPELINE_SCALE. Falling back to create_communities.")
+        return None
+    src = src_root / "networks" / network_id / "nodes.parquet"
+    return src if src.exists() else None
+
+
 def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: str,
                   pops_path: str, links_path: str,
                   loss_goal: float | None = None) -> None:
@@ -205,16 +240,40 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
 
     try:
         t0 = time.perf_counter()
-        # create_communities returns (assignments, loss); we only need the loss.
-        loss = create_communities(
-            pops_path, links_path,
-            scale=SCALE,
-            fraction_of_communities=ncom,
-            output_path=communities_path,
-            isolation_threshold=0.8,
-            refine_swaps=refine_swaps,
-            loss_goal=cc_goal,
-        )[1]
+
+        # Decide: clone the structure from a smaller-scale lake, or derive it
+        # fresh with create_communities(). CLONE_FROM_SCALE opts in; a missing
+        # per-network source falls back to create_communities().
+        src_nodes = clone_source_nodes_path(network_id)
+        clone_used = False
+        if src_nodes is not None:
+            # clone_communities returns (path, cloned_loss). It reuses THIS
+            # network's small-scale partition, scaling per-group counts (which
+            # are not exact multiples of the small scale) via reconciliation.
+            _, loss = clone_communities(
+                old_nodes_path=str(src_nodes),
+                pops_path=pops_path,
+                scale_old=float(CLONE_FROM_SCALE),
+                scale_new=SCALE,
+                output_path=communities_path,
+                seed=RANDOM_SEED,
+                verbose=True,
+            )
+            clone_used = True
+        else:
+            if CLONE_FROM_SCALE:
+                print(f"  [{network_id}] no clone source at scale "
+                      f"{CLONE_FROM_SCALE}; using create_communities()")
+            # create_communities returns (path, loss); we only need the loss.
+            loss = create_communities(
+                pops_path, links_path,
+                scale=SCALE,
+                fraction_of_communities=ncom,
+                output_path=communities_path,
+                isolation_threshold=0.8,
+                refine_swaps=refine_swaps,
+                loss_goal=cc_goal,
+            )[1]
 
         # Read the community assignment now, while the file still exists --
         # it gets deleted in `finally` below, before extract_nodes() runs.
@@ -256,8 +315,10 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
         'n_nodes':          graph.graph.number_of_nodes(),
         'n_edges':          graph.graph.number_of_edges(),
         'gen_time_s':       elapsed,
-        'refine_loss':      loss,        # achieved
+        'refine_loss':      loss,        # achieved (CLONED estimate if clone_used)
         'refine_loss_goal': loss_goal,   # None when no goal was applied
+        'clone_used':       clone_used,  # True -> loss is a cloned estimate, not optimized
+        'clone_src_scale':  float(CLONE_FROM_SCALE) if (clone_used and CLONE_FROM_SCALE) else None,
     })
 
     # NODES: keyed by network_id (per sample x agg_level x layer) -- the
@@ -272,9 +333,10 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
     if not nodes_df.empty:
         data_lake.write_nodes(network_id, "network_id", nodes_df)
 
+    loss_str = f"{loss:.6g}" if loss is not None else "n/a"
     print(f"  [{network_id}] {graph.graph.number_of_nodes()} nodes, "
           f"{graph.graph.number_of_edges()} edges, {elapsed:.1f}s "
-          f"(loss={loss:.6g}, goal={loss_goal})")
+          f"(loss={loss_str}, goal={loss_goal})")
 
 
 def main():
