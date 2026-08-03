@@ -47,7 +47,7 @@ from pathlib import Path
 import pandas as pd
 
 
-def _default_root() -> Path:
+def _default_root(PROJECT_ROOT: str | None = None) -> Path:
     """
     Resolution order, highest priority first:
       1. PROJECT_ROOT below, if set -- the explicit, one-true-location way
@@ -61,12 +61,15 @@ def _default_root() -> Path:
       3. A "data_lake" folder next to this file, as a fallback default.
     """
     
+    # (inside _default_root, replacing lines 63-69)
     if PROJECT_ROOT is not None:
         base = Path(PROJECT_ROOT).resolve()
     else:
         override = os.environ.get("DATA_LAKE_ROOT")
         base = Path(override).resolve() if override else Path(__file__).resolve().parent
-    return base / "data_lake"
+    scale = os.environ.get("PIPELINE_SCALE")
+    lake_name = f"data_lake_scale{scale}" if scale else "data_lake"
+    return base / lake_name
 
 
 # Set this to the one overarching folder everything should be built under,
