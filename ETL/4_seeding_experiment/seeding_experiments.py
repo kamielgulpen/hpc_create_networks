@@ -360,9 +360,9 @@ class SimulationConfig:
     max_steps:                 int   = 10000
     threshold_type:            str   = 'fractional'
     initial_infected_fraction: float = 0.01
-    min_threshold:             float = 0.3
+    min_threshold:             float = 0.2
     max_threshold:             float = 0.3
-    n_thresholds:              int   = 1
+    n_thresholds:              int   = 2
     base_seed:                 int   = 0
     verbose:                   int   = 0
     seeding:                   str   = 'neighbor_k'
