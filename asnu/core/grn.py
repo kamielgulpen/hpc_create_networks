@@ -1,32 +1,3 @@
-"""Python reference implementation of the Rust `run_edge_creation` kernel.
-
-Mirrors the Rust EdgeBuilder structure so the two implementations stay
-verifiably parallel:
-
-    _insert              <-> EdgeBuilder::insert
-    _maybe_reciprocate   <-> EdgeBuilder::maybe_reciprocate
-    _apply_transitivity  <-> EdgeBuilder::apply_transitivity
-    _create_edge         <-> EdgeBuilder::create_edge
-    establish_links      <-> the Phase A pair loop (one pair)
-    establish_links_phase_b <-> the Phase B pair loop (one pair)
-
-IMPORTANT — call ordering must match the Rust two-pass structure:
-
-    for (src, dst, target) in group_pairs:
-        establish_links(G, src, dst, target, ...)          # Phase A, ALL pairs
-    for (src, dst, target) in group_pairs:
-        establish_links_phase_b(G, src, dst, target, ...)  # Phase B, ALL pairs
-
-Running Phase B per-pair immediately after its Phase A (the old behaviour)
-gives Phase B a less complete graph than the Rust version sees.
-
-`G.existing_num_links` is the single source of truth for budgets — there is
-no separately mirrored `num_links` local, matching the Rust `link_counts`.
-
-"Exactly the same" means identical logic and distributions; RNG draw
-sequences cannot be bit-identical across languages.
-"""
-
 import bisect
 import math
 import random
@@ -34,8 +5,6 @@ from itertools import chain
 
 PHASE_B_COMM_WINDOW = 200
 
-
-# ── Budget helpers (single source of truth: G.existing_num_links) ──────────
 
 def _links(G, pair):
     return G.existing_num_links.get(pair, 0)
@@ -46,46 +15,82 @@ def _max_links(G, pair):
 
 
 def _node_to_community(G):
-    """node -> community id (FIRST tuple element; group ignored). Cached on G."""
     cache = getattr(G, "_node_to_community", None)
     if cache is None:
-        cache = {}
-        for (comm_id, _gid), nodes in G.communities_to_nodes.items():
-            for n in nodes:
-                cache[n] = comm_id
+        cache = {n: comm_id
+                 for (comm_id, _gid), nodes in G.communities_to_nodes.items()
+                 for n in nodes}
         G._node_to_community = cache
     return cache
 
 
+def _ensure_edge_index(G):
+    """Lazily build a fast side-index for the hot edge-creation loop:
+      G._edge_set : set of (u, v) for O(1) has_edge (networkx has_edge is slow)
+      G._adj_out  : {u: [v, ...]} out-neighbours, insertion-ordered
+      G._adj_in   : {v: [u, ...]} in-neighbours, insertion-ordered
+
+    Seeded from whatever edges already exist on G.graph so transitivity sees the
+    same neighbourhood networkx would report. The networkx graph stays
+    authoritative; this index just answers has_edge / neighbours faster and is
+    kept in sync inside _insert.
+    """
+    if getattr(G, "_edge_set", None) is not None:
+        return
+    edge_set = set()
+    adj_out, adj_in = {}, {}
+    for u, v in G.graph.edges():
+        edge_set.add((u, v))
+        adj_out.setdefault(u, []).append(v)
+        adj_in.setdefault(v, []).append(u)
+    G._edge_set = edge_set
+    G._adj_out = adj_out
+    G._adj_in = adj_in
+
+
 def _undirected_neighbors(G, d):
-    """Snapshot of d's UNDIRECTED neighbourhood (out ∪ in), deduplicated,
-    out-neighbours first — matches the Rust adjacency/in_adjacency scan.
-    Snapshot (list) because closures created during the scan must not
-    extend it."""
-    g = G.graph
-    if g.is_directed():
-        return list(dict.fromkeys(chain(g.successors(d), g.predecessors(d))))
-    return list(g.neighbors(d))
+    # out-neighbours first, then in-neighbours, deduplicated -- same order the
+    # networkx successors()+predecessors() scan produced, so RNG-dependent
+    # transitivity behaviour is unchanged.
+    out = G._adj_out.get(d)
+    inn = G._adj_in.get(d)
+    if out is None and inn is None:
+        return []
+    if inn is None:
+        return list(dict.fromkeys(out))
+    if out is None:
+        return list(dict.fromkeys(inn))
+    return list(dict.fromkeys(chain(out, inn)))
 
-
-# ── Edge creation primitives (mirror EdgeBuilder methods) ──────────────────
 
 def _insert(G, s, d, pair):
-    """Insert edge s→d attributed to `pair`. False if self-loop or exists."""
-    if s == d or G.graph.has_edge(s, d):
+    if s == d or (s, d) in G._edge_set:
         return False
-    G.graph.add_edge(s, d)
+    # Deferred: write to the fast index only. G.graph is bulk-loaded once at the
+    # end of edge creation (_flush_edges_to_graph). Nothing reads G.graph
+    # mid-creation -- transitivity reads the index.
+    G._edge_set.add((s, d))
+    G._adj_out.setdefault(s, []).append(d)
+    G._adj_in.setdefault(d, []).append(s)
     G.existing_num_links[pair] = _links(G, pair) + 1
     return True
 
 
-def _maybe_reciprocate(G, s, d, src_group, dst_group, reciprocity_p):
-    """Reciprocity roll for a fresh s(src_group) → d(dst_group) edge.
+def _flush_edges_to_graph(G):
+    """Bulk-load every indexed edge into G.graph in one call, then drop the
+    index. Call at the end of edge creation so G.graph is current for anything
+    downstream (fill_unfulfilled, counts, save). add_edges_from ignores the
+    duplicates re-included from the seed, so we pass the whole set directly."""
+    idx = getattr(G, "_edge_set", None)
+    if idx is None:
+        return
+    G.graph.add_edges_from(idx)
+    G._edge_set = G._adj_out = G._adj_in = None
 
-    NOTE: like the Rust, this checks only the reverse pair's maximum budget —
-    there is deliberately NO `num_links >= target` guard for self-pairs, so a
-    self-pair may overshoot its target by the reciprocal edge.
-    """
+
+def _maybe_reciprocate(G, s, d, src_group, dst_group, reciprocity_p):
+    # Deliberately checks only the reverse pair's MAX budget, not its target,
+    # so a self-pair may overshoot its target by the reciprocal edge.
     if random.random() >= reciprocity_p:
         return
     rev = (dst_group, src_group)
@@ -95,13 +100,6 @@ def _maybe_reciprocate(G, s, d, src_group, dst_group, reciprocity_p):
 
 def _apply_transitivity(G, s, d, src_group, budget_pair, target,
                         int_trans_p, ext_trans_p, reciprocity_p):
-    """Triadic closures through pivot d.
-
-    PER-NEIGHBOUR roll (not one gate for the whole scan): int_trans_p when n
-    shares d's community id, ext_trans_p otherwise; two unknown communities
-    are NOT treated as equal. Stops once `budget_pair` reaches `target`.
-    Each closure gets its own reciprocity roll.
-    """
     n2c = _node_to_community(G)
     d_comm = n2c.get(d)
 
@@ -111,8 +109,7 @@ def _apply_transitivity(G, s, d, src_group, budget_pair, target,
         if n == s:
             continue
 
-        n_comm = n2c.get(n)
-        internal = n_comm is not None and d_comm is not None and n_comm == d_comm
+        internal = d_comm is not None and n2c.get(n) == d_comm
         p = int_trans_p if internal else ext_trans_p
         if random.random() >= p:
             continue
@@ -129,8 +126,6 @@ def _apply_transitivity(G, s, d, src_group, budget_pair, target,
 
 def _create_edge(G, s, d, src_group, dst_group, target,
                  reciprocity_p, int_trans_p, ext_trans_p):
-    """Primary edge s→d plus reciprocity and transitivity follow-ons.
-    Returns True iff the primary edge was created."""
     pair = (src_group, dst_group)
     if not _insert(G, s, d, pair):
         return False
@@ -142,26 +137,18 @@ def _create_edge(G, s, d, src_group, dst_group, target,
 
 
 def _effective_transitivity(transitivity_p, internal_p, external_p):
-    """Negative per-side values fall back to the scalar (matches Rust)."""
     int_p = transitivity_p if internal_p < 0 else internal_p
     ext_p = transitivity_p if external_p < 0 else external_p
     return int_p, ext_p
 
 
-# ── Phase A: community-based edge creation (one group pair) ────────────────
-
 def establish_links(G, src_id, dst_id,
-                    target_link_count, fraction, reciprocity_p, transitivity_p,
-                    valid_communities=None, pa_scope="local",
+                    target_link_count, reciprocity_p, transitivity_p,
+                    valid_communities=None,
                     bridge_probability=0, number_of_communities=1,
                     internal_transitivity_p=-1.0, external_transitivity_p=-1.0):
-    """Phase A for one (src_id, dst_id) pair. Run over ALL pairs before any
-    Phase B call. Returns True iff the target was reached in Phase A.
-
-    Communities are iterated sequentially (shuffled once per pair) so each
-    community exhausts a proportional quota before moving on, concentrating
-    edges within communities and raising transitivity.
-    """
+    # Phase A for one (src, dst) pair. Run over ALL pairs before any Phase B.
+    _ensure_edge_index(G)
     int_p, ext_p = _effective_transitivity(
         transitivity_p, internal_transitivity_p, external_transitivity_p)
 
@@ -171,7 +158,6 @@ def establish_links(G, src_id, dst_id,
     if not valid_communities:
         return False
 
-    # Deduplicate (list may carry duplicates for weighting) and shuffle.
     comm_order = list(dict.fromkeys(valid_communities))
     random.shuffle(comm_order)
     n_comms = len(comm_order)
@@ -188,79 +174,49 @@ def establish_links(G, src_id, dst_id,
                 break
             quota = max(1, math.ceil(remaining / n_comms))
 
-            if community_id not in src_node_cache:
-                src_node_cache[community_id] = G.communities_to_nodes.get(
-                    (community_id, src_id), [])
-            src_nodes = src_node_cache[community_id]
+            src_nodes = src_node_cache.setdefault(
+                community_id,
+                G.communities_to_nodes.get((community_id, src_id), []))
             if not src_nodes:
                 continue
 
-            # Bridge or normal dst community.
             if (bridge_probability > 0 and number_of_communities > 1
                     and random.random() < bridge_probability):
-                direction = random.choice([-1, 1])
-                dst_community = (community_id + direction) % number_of_communities
+                # Bridge: a random shortcut to any OTHER community (small-world
+                # rewiring). Community ids carry no spatial meaning (ring
+                # coordinates are a random permutation), so a uniform pick over
+                # the other communities is the coherent choice. Excludes the
+                # source community so a bridge always leaves.
+                dst_community = random.randrange(number_of_communities - 1)
+                if dst_community >= community_id:
+                    dst_community += 1
             else:
                 dst_community = community_id
 
-            # Popularity pool for (dst_community, dst_group): a random
-            # `fraction`-sized sample; PA below grows it with repeats.
-            pool_key = (dst_community, dst_id)
-            if pool_key not in G.popularity_pool:
-                pool = list(G.communities_to_nodes.get(pool_key, []))
-                if pool:
-                    sample_size = min(len(pool), math.ceil(len(pool) * fraction))
-                    random.shuffle(pool)
-                    del pool[sample_size:]
-                G.popularity_pool[pool_key] = pool
-            if not G.popularity_pool[pool_key]:
+            dst_nodes = G.communities_to_nodes.get((dst_community, dst_id), [])
+            if not dst_nodes:
                 continue
 
-            # Create up to `quota` edges within this community.
             created = 0
             for _attempt in range(quota * 3):
                 if created >= quota or _links(G, pair) >= target_link_count:
                     break
                 s = random.choice(src_nodes)
-                d = random.choice(G.popularity_pool[pool_key])
-
-                if not _create_edge(G, s, d, src_id, dst_id, target_link_count,
-                                    reciprocity_p, int_p, ext_p):
-                    continue
-                created += 1
-
-                # Preferential attachment: occasionally re-add d to pools so
-                # it gets picked more often.
-                if fraction != 1.0 and random.random() > fraction:
-                    if pa_scope == "global":
-                        for comm_id in range(number_of_communities):
-                            if random.random() < fraction / number_of_communities:
-                                global_key = (comm_id, dst_id)
-                                if global_key in G.popularity_pool:
-                                    G.popularity_pool[global_key].append(d)
-                    elif random.random() > fraction:
-                        G.popularity_pool[pool_key].append(d)
-                        pool_nodes = G.communities_to_nodes.get(pool_key, [])
-                        if pool_nodes:
-                            G.popularity_pool[pool_key].append(random.choice(pool_nodes))
+                d = random.choice(dst_nodes)
+                if _create_edge(G, s, d, src_id, dst_id, target_link_count,
+                                reciprocity_p, int_p, ext_p):
+                    created += 1
 
     return _links(G, pair) >= target_link_count
 
-
-# ── Phase B: spatial ring search (one group pair) ──────────────────────────
 
 def establish_links_phase_b(G, src_id, dst_id, target_link_count,
                             reciprocity_p, transitivity_p,
                             internal_transitivity_p=-1.0,
                             external_transitivity_p=-1.0):
-    """Phase B for one (src_id, dst_id) pair still under budget: find nearest
-    dst communities by centroid and pick a random node from each — spreading
-    degree load across nodes rather than targeting edge-nearest ones.
-
-    Run only after Phase A has completed for ALL pairs (matches the Rust
-    two-pass structure). Requires G.node_coordinates; no-op without it.
-    Returns True iff the target was reached.
-    """
+    # Run only after Phase A has completed for ALL pairs. No-op without
+    # G.node_coordinates.
+    _ensure_edge_index(G)
     int_p, ext_p = _effective_transitivity(
         transitivity_p, internal_transitivity_p, external_transitivity_p)
 
@@ -272,10 +228,9 @@ def establish_links_phase_b(G, src_id, dst_id, target_link_count,
     if node_coordinates is None:
         return False
 
-    # Sorted arrays, cached on G (same content as the Rust precompute).
     if not hasattr(G, "_phase_b_src_sorted"):
-        G._phase_b_src_sorted = {}       # group_id -> sorted [(theta, node)]
-        G._phase_b_dst_comm_sorted = {}  # group_id -> sorted [(centroid, comm)]
+        G._phase_b_src_sorted = {}
+        G._phase_b_dst_comm_sorted = {}
 
     if src_id not in G._phase_b_src_sorted:
         G._phase_b_src_sorted[src_id] = sorted(

@@ -13,8 +13,9 @@ import json
 import random
 from itertools import product
 from tqdm import tqdm
-
 import numpy as np
+
+from asnu.core.refine import refine_communities_move
 
 def create_communities(pops_path, links_path, scale, fraction_of_communities=None,
                        output_path='communities.json',
@@ -155,50 +156,45 @@ def populate_communities(G, num_communities, refine_swaps, loss_goal=0, seed=42)
                 G.communities_to_groups.setdefault(comm, []).append(gid)
             idx += count
 
-    # Refinement
-    try:
-        from asnu_rust import refine_communities_move
-        print(f"\nRefining communities with {refine_swaps} swap iterations...")
 
-        refine_nodes = np.array(list(G.graph.nodes), dtype=np.int64)
-        refine_node_groups = np.array(
-            [G.nodes_to_group[n] for n in refine_nodes], dtype=np.int64
-        )
-        refine_assignments = np.array(
-            [G.nodes_to_communities[int(n)] for n in refine_nodes], dtype=np.int64
-        )
-        refine_budget = {(int(k[0]), int(k[1])): int(v)
-                         for k, v in G.maximum_num_links.items() if v > 0}
+        
+    print(f"\nRefining communities with {refine_swaps} swap iterations...")
 
-        new_assignments, loss = refine_communities_move(
-            refine_assignments,
-            refine_node_groups,
-            refine_budget,
-            n_groups,
-            G.number_of_communities,
-            refine_swaps,
-            loss_goal,
-            1,
-            42,
-        )
+    refine_nodes = np.array(list(G.graph.nodes), dtype=np.int64)
+    refine_node_groups = np.array(
+        [G.nodes_to_group[n] for n in refine_nodes], dtype=np.int64
+    )
+    refine_assignments = np.array(
+        [G.nodes_to_communities[int(n)] for n in refine_nodes], dtype=np.int64
+    )
+    refine_budget = {(int(k[0]), int(k[1])): int(v)
+                        for k, v in G.maximum_num_links.items() if v > 0}
 
-        G.communities_to_nodes = {}
-        G.communities_to_groups = {}
-        G.nodes_to_communities = {}
-        for i in range(len(refine_nodes)):
-            node = int(refine_nodes[i])
-            comm = int(new_assignments[i])
-            group = int(refine_node_groups[i])
-            G.nodes_to_communities[node] = comm
-            G.communities_to_nodes.setdefault((comm, group), []).append(node)
-            G.communities_to_groups.setdefault(comm, []).append(group)
+    new_assignments, loss = refine_communities_move(
+        refine_assignments,
+        refine_node_groups,
+        refine_budget,
+        n_groups,
+        G.number_of_communities,
+        refine_swaps,
+        loss_goal,
+        1,
+        42,
+    )
 
-        print("Refinement complete.")
+    G.communities_to_nodes = {}
+    G.communities_to_groups = {}
+    G.nodes_to_communities = {}
+    for i in range(len(refine_nodes)):
+        node = int(refine_nodes[i])
+        comm = int(new_assignments[i])
+        group = int(refine_node_groups[i])
+        G.nodes_to_communities[node] = comm
+        G.communities_to_nodes.setdefault((comm, group), []).append(node)
+        G.communities_to_groups.setdefault(comm, []).append(group)
 
-    except ImportError:
-        print("  refine_communities_move not available; skipping refinement.")
-        new_assignments = refine_assignments  # fall back to pre-refinement assignments
-        loss = None
+    print("Refinement complete.")
+
 
     K_new = int(new_assignments.max()) + 1
     G.number_of_communities = K_new

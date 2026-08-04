@@ -1,50 +1,5 @@
-"""
-Community CLONING for ASNU -- an alternative to create_communities().
-
-Where create_communities() derives a community partition from scratch (assign +
-expensive Rust refinement), clone_communities() takes a partition already
-computed at a SMALL scale and scales it up by making integer copies of each
-community, reconciling the (non-multiplicative) per-group node counts. This
-skips the refinement entirely at the large scale.
-
-Why it's valid
---------------
-The refinement loss is  sum_pairs |achieved(g,h) - budget(g,h)|  where
-achieved(g,h) = sum_communities count_g(c)*count_h(c) is a within-community
-pairing count over demographic GROUPS. Budgets scale ~linearly with `scale`
-(they are n*scale). Cloning each community f times keeps per-copy group counts
-fixed, so total achieved(g,h) becomes f*original -- matching f*budget. The loss
-scales by f and loss-per-unit-budget (quality) is unchanged.
-
-Non-multiplicative counts (the reconciliation step)
----------------------------------------------------
-init_nodes() sizes each group via stratified_allocate: floor(scale*n) then a
-remainder handed to the largest groups. floor(0.01*n)*10 != floor(0.10*n) in
-general, and the remainder lands differently at each scale, so the true
-large-scale per-group counts are NOT exactly f x the small-scale counts. Cloning
-implies count_g*f per group; the true new node set wants a different number.
-Per group we reconcile:
-  * deficit (true > clone-implied): distribute leftover new nodes across that
-    group's clone communities, proportional to how many of the group each holds.
-  * surplus (true < clone-implied): drop the excess slots, largest holders first.
-Result: per-group totals match a fresh init_nodes() at the new scale EXACTLY,
-node ids are contiguous 0..N-1, and every node gets a community -- so generate()
-and load_communities() consume the output unchanged.
-
-Output schema is identical to what populate_communities() writes:
-number_of_communities, nodes_to_communities, communities_to_nodes,
-communities_to_groups, node_coordinates.
-
-Public function
----------------
-clone_communities(old_nodes_path, pops_path, scale_old, scale_new,
-                  output_path='communities.json', ...) -> (output_path, loss)
-
-The return shape mirrors create_communities() -- (path, loss) -- so callers can
-swap one for the other. `loss` here is the CLONED loss estimate (~f x the small-
-scale loss); it is not a freshly optimized value. It's returned for bookkeeping
-parity, and clone_source=True is recorded so downstream code can tell.
-"""
+"""Clone an existing community partition from a small scale up to a larger one
+by making integer copies of each community and reconciling per-group counts."""
 
 import json
 from collections import defaultdict
@@ -55,13 +10,7 @@ import pandas as pd
 from asnu.core.utils import desc_groups, stratified_allocate, read_file
 
 
-# ---------------------------------------------------------------------------
-# group lookup (stable across scales: group ids come from population.parquet
-# sorted by n desc, same file at both scales)
-# ---------------------------------------------------------------------------
-
 def _norm_val(val):
-    """Type-normalise a demographic value so parquet reads match pop-file values."""
     if isinstance(val, np.integer):
         val = int(val)
     if isinstance(val, np.floating):
@@ -74,47 +23,34 @@ def _norm_val(val):
 
 
 def _build_group_lookup(pops_path, pop_column='n'):
-    """Return (attrs_to_group, characteristic_cols) matching init_nodes/desc_groups."""
-    group_desc, characteristic_cols = desc_groups(pops_path, pop_column=pop_column)
-    attrs_to_group = {}
-    for gid, info in group_desc.items():
-        key = tuple(sorted((str(c), _norm_val(info[c])) for c in characteristic_cols))
-        attrs_to_group[key] = gid
-    return attrs_to_group, characteristic_cols
+    group_desc, cols = desc_groups(pops_path, pop_column=pop_column)
+    attrs_to_group = {
+        tuple(sorted((str(c), _norm_val(info[c])) for c in cols)): gid
+        for gid, info in group_desc.items()
+    }
+    return attrs_to_group, cols
 
 
-def _old_community_signatures(old_nodes_path, attrs_to_group, characteristic_cols):
-    """
-    Recover {old_community_id: {group_id: count}} from the small-scale
-    nodes.parquet by mapping each node's demographic columns back to a stable
-    group id (never trusting the small-scale positional node ids).
-
-    Returns (sig, unmatched_row_count).
-    """
+def _old_community_signatures(old_nodes_path, attrs_to_group, cols):
+    """Recover {old_community_id: {group_id: count}} from the small-scale nodes."""
     df = read_file(old_nodes_path)
 
     if 'community_id' not in df.columns:
-        raise ValueError(
-            f"{old_nodes_path}: no 'community_id' column; cannot clone from it")
-
-    missing = [c for c in characteristic_cols if c not in df.columns]
+        raise ValueError(f"{old_nodes_path}: no 'community_id' column")
+    missing = [c for c in cols if c not in df.columns]
     if missing:
-        raise ValueError(
-            f"{old_nodes_path}: missing demographic columns {missing}; "
-            f"columns present: {list(df.columns)}")
+        raise ValueError(f"{old_nodes_path}: missing demographic columns {missing}")
 
     df = df[df['community_id'].notna()].copy()
     df['community_id'] = df['community_id'].astype(np.int64)
 
     lookup = pd.DataFrame(
-        [{**{c: v for c, v in key}, '_gid': gid} for key, gid in attrs_to_group.items()])
+        [{**dict(key), '_gid': gid} for key, gid in attrs_to_group.items()])
 
-    norm = df[characteristic_cols].copy()
-    for c in characteristic_cols:
-        norm[c] = norm[c].map(_norm_val)
+    norm = df[cols].apply(lambda col: col.map(_norm_val))
     norm['community_id'] = df['community_id'].values
 
-    merged = norm.merge(lookup, on=characteristic_cols, how='left')
+    merged = norm.merge(lookup, on=cols, how='left')
     unmatched = int(merged['_gid'].isna().sum())
     merged = merged[merged['_gid'].notna()]
     merged['_gid'] = merged['_gid'].astype(np.int64)
@@ -126,26 +62,18 @@ def _old_community_signatures(old_nodes_path, attrs_to_group, characteristic_col
 
 
 def _new_group_node_lists(pops_path, scale_new, pop_column='n'):
-    """
-    Reproduce init_nodes() numbering at the NEW scale.
-    Returns (group_to_nodes, group_total, n_nodes_total).
-    """
+    """Reproduce init_nodes() numbering at the new scale."""
     group_desc, _ = desc_groups(pops_path, pop_column=pop_column)
     alloc = stratified_allocate(
         [(gid, group_desc[gid][pop_column]) for gid in group_desc], scale_new)
 
-    group_to_nodes = {}
-    node_id = 0
-    for gid in group_desc:                 # SAME order as init_nodes()
+    group_to_nodes, node_id = {}, 0
+    for gid in group_desc:
         n = alloc[gid]
         group_to_nodes[gid] = list(range(node_id, node_id + n))
         node_id += n
     return group_to_nodes, {g: len(v) for g, v in group_to_nodes.items()}, node_id
 
-
-# ---------------------------------------------------------------------------
-# clone + reconcile
-# ---------------------------------------------------------------------------
 
 def _shrink_demand(demand, remove_n):
     for _ in range(remove_n):
@@ -159,43 +87,32 @@ def _grow_demand(demand, add_n):
     sizes = np.array([d[1] for d in demand], dtype=np.float64)
     if sizes.sum() == 0:
         sizes = np.ones_like(sizes)
-    weights = sizes / sizes.sum()
-    exact = weights * add_n
+    exact = sizes / sizes.sum() * add_n
     base = np.floor(exact).astype(int)
     for i in range(len(demand)):
         demand[i][1] += int(base[i])
-    rem = add_n - int(base.sum())
-    order = np.argsort(-(exact - base))
-    for i in range(rem):
-        demand[order[i % len(demand)]][1] += 1
+    for i in np.argsort(-(exact - base))[:add_n - int(base.sum())]:
+        demand[i][1] += 1
 
 
 def _clone_and_assign(sig, factor, group_to_nodes, group_total, seed=42):
-    """
-    Build node->community assignments by cloning each old community `factor`
-    times and reconciling per-group counts to the true new node set.
-
-    Returns (nodes_to_communities, n_communities, per_group_reconcile) where
-    per_group_reconcile[g] = (clone_implied, true_new_total, delta).
-    """
+    """Clone each old community `factor` times and reconcile per-group counts."""
     rng = np.random.default_rng(seed)
 
-    clone_specs = []          # (new_comm_id, {group: count})
-    raw_id = 0
-    for c in sorted(sig.keys()):
-        for _k in range(factor):
+    clone_specs, raw_id = [], 0
+    for c in sorted(sig):
+        for _ in range(factor):
             clone_specs.append((raw_id, dict(sig[c])))
             raw_id += 1
     n_communities = raw_id
 
-    group_demand = defaultdict(list)      # group -> [[clone_idx, desired_count], ...]
+    group_demand = defaultdict(list)      # group -> [[clone_idx, count], ...]
     for idx, (_cid, gc) in enumerate(clone_specs):
         for g, cnt in gc.items():
             if cnt > 0:
                 group_demand[g].append([idx, cnt])
 
-    nodes_to_communities = {}
-    per_group_reconcile = {}
+    nodes_to_communities, per_group_reconcile = {}, {}
 
     for g in sorted(set(group_total) | set(group_demand)):
         pool = list(group_to_nodes.get(g, []))
@@ -211,12 +128,9 @@ def _clone_and_assign(sig, factor, group_to_nodes, group_total, seed=42):
             if demand:
                 _grow_demand(demand, delta)
             else:
-                # group absent from every clone community (too rare at small
-                # scale): attach its nodes to the largest clone community so
-                # they aren't lost.
+                # group absent from every clone: attach to the largest one
                 sizes = [sum(gc.values()) for _cid, gc in clone_specs]
-                j = int(np.argmax(sizes)) if sizes else 0
-                demand = [[j, delta]]
+                demand = [[int(np.argmax(sizes)) if sizes else 0, delta]]
                 group_demand[g] = demand
 
         cursor = 0
@@ -237,17 +151,12 @@ def _clone_and_assign(sig, factor, group_to_nodes, group_total, seed=42):
     return nodes_to_communities, n_communities, per_group_reconcile
 
 
-# ---------------------------------------------------------------------------
-# serialise (populate_communities()'s exact schema)
-# ---------------------------------------------------------------------------
-
 def _serialise(nodes_to_communities, n_communities, nodes_to_group, seed=42):
     communities_to_nodes = defaultdict(list)
     communities_to_groups = defaultdict(set)
     for node, comm in nodes_to_communities.items():
-        g = nodes_to_group[node]
         communities_to_nodes[comm].append(int(node))
-        communities_to_groups[comm].add(int(g))
+        communities_to_groups[comm].add(int(nodes_to_group[node]))
 
     rng = np.random.default_rng(seed)
     K = max(n_communities, 1)
@@ -267,67 +176,28 @@ def _serialise(nodes_to_communities, n_communities, nodes_to_group, seed=42):
 
 
 def _estimate_cloned_loss(sig, factor, budget):
-    """
-    Estimate the loss of the cloned assignment against a NEW-scale budget:
-        loss = sum_pairs |achieved - budget|,  achieved = f * sum_c count_g*count_h.
-    budget: {(g,h): int}. Returns float, or None if budget is None.
-    """
+    """loss = sum_pairs |achieved - budget|, achieved = f * sum_c count_g*count_h."""
     if budget is None:
         return None
     achieved = defaultdict(int)
-    for _c, gc in sig.items():
+    for gc in sig.values():
         for g, cg in gc.items():
             for h, ch in gc.items():
-                achieved[(g, h)] += cg * ch
-    for k in achieved:
-        achieved[k] *= factor
+                achieved[(g, h)] += cg * ch * factor
 
-    loss = 0.0
-    seen = set()
-    for (g, h), av in achieved.items():
-        bv = budget.get((g, h), 0)
-        loss += abs(av - bv)
-        seen.add((g, h))
-    for (g, h), bv in budget.items():
-        if (g, h) not in seen:
-            loss += abs(bv)
+    loss = sum(abs(av - budget.get(k, 0)) for k, av in achieved.items())
+    loss += sum(abs(bv) for k, bv in budget.items() if k not in achieved)
     return float(loss)
 
-
-# ---------------------------------------------------------------------------
-# public entry point
-# ---------------------------------------------------------------------------
 
 def clone_communities(old_nodes_path, pops_path, scale_old, scale_new,
                       output_path='communities.json',
                       factor=None, pop_column='n', seed=42,
                       budget=None, verbose=True):
-    """
-    Clone a small-scale community partition up to a larger scale.
+    """Clone a small-scale community partition up to a larger scale.
 
-    Parameters
-    ----------
-    old_nodes_path : str
-        nodes.parquet from the small-scale run (needs 'community_id' + the
-        demographic characteristic columns).
-    pops_path : str
-        population.parquet (same file drives group ids at both scales).
-    scale_old, scale_new : float
-        The small and target scales, e.g. 0.01 and 0.10.
-    output_path : str
-        Where to write the communities JSON.
-    factor : int, optional
-        Clones per community. Default round(scale_new / scale_old).
-    budget : dict, optional
-        {(g,h): int} new-scale edge budget, for the cloned-loss estimate only.
-    verbose : bool
-        Print a per-group reconciliation summary.
-
-    Returns
-    -------
-    (output_path, loss) : (str, float | None)
-        Mirrors create_communities(). `loss` is the CLONED-loss estimate
-        (None if no budget given).
+    Returns (output_path, loss), mirroring create_communities(). `loss` is the
+    cloned-loss estimate (None if no budget given).
     """
     f = factor if factor is not None else int(round(scale_new / scale_old))
     if f < 1:
@@ -341,10 +211,8 @@ def clone_communities(old_nodes_path, pops_path, scale_old, scale_new,
     nodes_to_communities, n_comm, recon = _clone_and_assign(
         sig, f, group_to_nodes, group_total, seed=seed)
 
-    nodes_to_group = {}
-    for g, nodelist in group_to_nodes.items():
-        for nid in nodelist:
-            nodes_to_group[int(nid)] = int(g)
+    nodes_to_group = {int(nid): int(g)
+                      for g, nodelist in group_to_nodes.items() for nid in nodelist}
 
     data = _serialise(nodes_to_communities, n_comm, nodes_to_group, seed=seed)
     with open(output_path, 'w', encoding='utf-8') as fh:
