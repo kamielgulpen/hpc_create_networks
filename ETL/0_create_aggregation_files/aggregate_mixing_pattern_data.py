@@ -99,7 +99,7 @@ if __name__ == "__main__":
     # Point these at your actual files.
     population = pd.read_csv("Data/Data/tab_n_(with oplniv).csv", dtype={"lft": str})
     interaction_layers = {
-        "huishouden":pd.read_csv("Data/Data/tab_buren.csv", dtype={"lft_src": str, "lft_dst": str}),
+        "huishouden":pd.read_csv("Data/Data/tab_huishouden.csv", dtype={"lft_src": str, "lft_dst": str}),
         "werkschool":pd.read_csv("Data/Data/tab_werkschool.csv", dtype={"lft_src": str, "lft_dst": str}),
         "buren":     pd.read_csv("Data/Data/tab_buren.csv", dtype={"lft_src": str, "lft_dst": str}),
         "familie":   pd.read_csv("Data/Data/tab_familie.csv", dtype={"lft_src": str, "lft_dst": str}),

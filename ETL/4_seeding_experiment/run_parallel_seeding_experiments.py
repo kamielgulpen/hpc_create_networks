@@ -35,8 +35,12 @@ def discover_network_ids() -> list[str]:
     net_dir = data_lake.ROOT / 'networks'
     if not net_dir.exists():
         return []
-    return sorted(p.name for p in net_dir.iterdir()
-                  if p.is_dir() and (p / 'edges.npz').exists())
+    return sorted(
+        p.name for p in net_dir.iterdir()
+        if p.is_dir() 
+        and "werkschool" in p.name 
+        and (p / 'edges.npz').exists()
+    )
 
 def discover_network_aggregation() -> list[str]:
     net_dir = data_lake.ROOT / 'networks'

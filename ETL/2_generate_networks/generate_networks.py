@@ -34,7 +34,6 @@ import data_lake
 SCALE           = float(os.environ.get("PIPELINE_SCALE", "0.01"))
 RECIPROCITY_P   = 1
 RANDOM_SEED     = 42
-PREF_ATTACHMENT = 0
 BRIDGE_PROBABILITY = 0.0
 
 # Community CLONING switch (opt-in, unset = original behaviour).
@@ -281,7 +280,6 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
 
         graph = generate(
             pops_path, links_path,
-            preferential_attachment=PREF_ATTACHMENT,
             scale=SCALE,
             reciprocity=RECIPROCITY_P,
             transitivity=tr,
@@ -308,7 +306,7 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
     data_lake.write_network_meta(
         network_id, run_id=run_id, agg_level_id=agg_level_id,
         gen_seed=RANDOM_SEED, layer=layer,
-        pref_attachment=PREF_ATTACHMENT, bridge_probability=BRIDGE_PROBABILITY,
+        bridge_probability=BRIDGE_PROBABILITY,
     )
 
     data_lake.write_network_stats(network_id, {
