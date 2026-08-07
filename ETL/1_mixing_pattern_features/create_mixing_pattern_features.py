@@ -13,6 +13,9 @@ population_hhi
     HHI of the population across the full joint grouping. A coarseness /
     aggregation-size signal (higher = fewer, more dominant groups).
 
+per layer ({layer}_...):
+    _degree_node_mean       mean interactions per individual (total interactions / total population)
+
 per layer x attribute ({layer}_{attr}_...):
     _population_hhi        marginal population HHI on this attribute
                            (== _homophily_expected)
@@ -91,12 +94,19 @@ def attr_homophily_features(interactions: pd.DataFrame, population: pd.DataFrame
 
 
 def compute_mixing_features(population: pd.DataFrame,
-                            interaction_layers: dict[str, pd.DataFrame],
-                            keep_cols: list[str]) -> dict[str, float]:
+                             interaction_layers: dict[str, pd.DataFrame],
+                             keep_cols: list[str]) -> dict[str, float]:
+    total_pop = population["n"].sum()
     features = {"population_hhi": hhi(population["n"])}
+
     for layer, df in interaction_layers.items():
+        # Compute mean degree per node for this layer
+        total_interactions = df["n"].sum()
+        features[f"{layer}_degree_node_mean"] = float(total_interactions / total_pop) if total_pop > 0 else float("nan")
+
         for attr in present_attributes(df, population, keep_cols):
             features.update(attr_homophily_features(df, population, attr, layer))
+            
     return features
 
 
