@@ -193,7 +193,7 @@ def compute_metrics(edges: np.ndarray, community_compact: np.ndarray | None = No
     # Extract the directed edgelist ONCE here; both community_structure_stats
     # calls below reuse it instead of re-extracting from G each time.
     edges_arr = _edge_array(G)
-
+    BIG = 900_000  # threshold for community detection; label propagation is O(n^2) in memory
     if n < BIG:
         und = G.as_undirected(mode="collapse")
         part = und.community_label_propagation()
