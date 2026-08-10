@@ -42,7 +42,10 @@ def already_done(network_id: str) -> bool:
     if not stats_path.exists():
         return False
     df = pd.read_parquet(stats_path)
-    return 'global_clustering' in set(df['stat_name'])
+    row = df[df['stat_name'] == 'global_clustering']
+    if row.empty:
+        return False
+    return row['value'].notna().any()
 
 
 def run_task(network_id: str, script: str, python: str, logs_dir: Path) -> tuple[str, int]:
