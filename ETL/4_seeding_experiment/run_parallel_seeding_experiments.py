@@ -57,7 +57,6 @@ def discover_ks(aggregations: list[tuple[str, str, str]]) -> list[int]:
     ks = {}
     for aggregation in aggregations:
        df = pd.read_parquet(data_lake.ROOT / 'aggregation_levels' / aggregation[0]/ 'mixing_features.parquet')
-       print(df)
        k = df[df["feature_name"] == f"{aggregation[1]}_degree_node_mean"]["feature_value"].iloc[0]
        ks[aggregation[2]] = int(k)
     return ks
@@ -76,7 +75,6 @@ def run_task(network_id: str, ks, args, logs_dir: Path) -> tuple[str, int]:
     env["OMP_NUM_THREADS"] = str(args.cores_per_task)
     env["PYTHONUNBUFFERED"] = "1"
 
-    print(args, ks)
     cmd = [
         args.python, args.script,
         "--network_id", network_id,
