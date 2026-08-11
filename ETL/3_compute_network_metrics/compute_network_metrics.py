@@ -21,11 +21,21 @@ rather than being an artifact of community-size differences.
 One network per invocation, selected by --network_id or --task_id (index
 into the sorted list of all networks that have an edges.npz). Run many of
 these in parallel with run_parallel_compute_network_metrics.py.
+
+PERFORMANCE NOTE (see community_structure_stats): the pair statistics are
+computed from a sparse representation of the community-by-community edge
+matrix. The previous implementation materialized seven dense k x k float64
+arrays plus two k x k boolean masks, which is O(k^2) in both time and
+memory: ~27 s and ~2.8 GB at k=5,000, and ~22 GB (unschedulable) at
+k=20,000. k is not bounded by anything in this pipeline -- label
+propagation on a sparse graph routinely returns tens of thousands of
+labels -- so that was a hard ceiling, not just a slow path. The current
+version is O(m log m) and flat in k. Output is unchanged to within 1e-9 on
+every emitted statistic.
 """
 
 import argparse
 import gc
-import itertools
 import json
 import os
 from pathlib import Path
@@ -39,24 +49,7 @@ import data_lake
 
 BIG = 900_000
 
-
-def _edge_array(G) -> np.ndarray:
-    """(m, 2) int64 directed edge endpoints, extracted the fast way.
-
-    Replaces `np.array(G.get_edgelist(), dtype=np.int64)`. get_edgelist()
-    yields a list of (src, dst) tuples; chaining them into one flat stream
-    and using fromiter with an explicit count skips NumPy's per-tuple shape
-    inference. ~4x faster at ~6M edges (1.8s vs 7.4s), bit-identical result.
-    """
-    m = G.ecount()
-    if m == 0:
-        return np.empty((0, 2), dtype=np.int64)
-    flat = np.fromiter(
-        itertools.chain.from_iterable(G.get_edgelist()),
-        dtype=np.int64,
-        count=m * 2,
-    )
-    return flat.reshape(m, 2)
+_STAT_KEYS = ["mean", "std", "min", "q25", "median", "q75", "max", "skew"]
 
 
 def load_edges(npz_file: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -99,8 +92,7 @@ def load_edges(npz_file: Path) -> tuple[np.ndarray, np.ndarray]:
 
 def dist_stats(x, prefix):
     if len(x) == 0:
-        return {f"{prefix}_{k}": 0.0 for k in
-                ["mean", "std", "min", "q25", "median", "q75", "max", "skew"]}
+        return {f"{prefix}_{k}": 0.0 for k in _STAT_KEYS}
     return {
         f"{prefix}_mean":   float(np.mean(x)),
         f"{prefix}_std":    float(np.std(x)),
@@ -110,6 +102,74 @@ def dist_stats(x, prefix):
         f"{prefix}_q75":    float(np.quantile(x, 0.75)),
         f"{prefix}_max":    float(np.max(x)),
         f"{prefix}_skew":   float(stats.skew(x)),
+    }
+
+
+def _dist_stats_with_zeros(vals, n_zeros, prefix):
+    """dist_stats over `vals` plus `n_zeros` implicit zeros.
+
+    Exact, not approximate -- this reproduces what dist_stats() would
+    return if you actually built the array of n_zeros zeros followed by
+    vals, which is what the dense k x k formulation did. Two things make
+    that avoidable:
+
+      - mean/std/skew need only the sum, and the 2nd and 3rd central
+        moments; each omitted zero sits at distance -mean from the mean and
+        so contributes a known amount to each.
+      - the zeros are all at the bottom of the sorted array, so a quantile
+        either lands inside the zero block (and is 0) or inside the sorted
+        nonzeros. This matches numpy's default 'linear' interpolation.
+
+    Central moments rather than raw power sums: `s2/N - mean**2` loses
+    about eight significant digits when the variance is small relative to
+    mean**2, which is exactly the intra-community edge-count case (large
+    counts, tight spread, no implicit zeros).
+
+    scipy.stats.skew returns nan for zero-variance input, so a constant
+    distribution (e.g. a network with no intra-community edges at all,
+    where every intra pair is 0) yields skew=nan. That is the pre-existing
+    behavior and is reproduced here rather than quietly coerced to 0.0.
+    """
+    nnz = len(vals)
+    N = nnz + n_zeros
+    if N == 0:                       # dist_stats' empty branch
+        return {f"{prefix}_{k}": 0.0 for k in _STAT_KEYS}
+    if nnz == 0:                     # every value is an implicit zero
+        rec = {f"{prefix}_{k}": 0.0 for k in _STAT_KEYS}
+        rec[f"{prefix}_skew"] = float("nan")
+        return rec
+
+    v = np.sort(np.asarray(vals, dtype=np.float64))
+    mean = float(v.sum()) / N
+    d = v - mean
+    m2 = (float(d @ d) + n_zeros * mean ** 2) / N
+    m3 = (float((d * d) @ d) - n_zeros * mean ** 3) / N
+    std = np.sqrt(max(m2, 0.0))
+    skew = float("nan") if m2 <= 0 else m3 / m2 ** 1.5
+
+    def _at(i):
+        if i < n_zeros:
+            return 0.0
+        j = i - n_zeros
+        return float(v[j]) if j < nnz else float(v[-1])
+
+    def _q(p):
+        pos = p * (N - 1)
+        lo = int(np.floor(pos))
+        frac = pos - lo
+        a = _at(lo)
+        b = _at(min(lo + 1, N - 1))
+        return a + frac * (b - a)
+
+    return {
+        f"{prefix}_mean":   float(mean),
+        f"{prefix}_std":    float(std),
+        f"{prefix}_min":    0.0 if n_zeros else float(v[0]),
+        f"{prefix}_q25":    float(_q(0.25)),
+        f"{prefix}_median": float(_q(0.50)),
+        f"{prefix}_q75":    float(_q(0.75)),
+        f"{prefix}_max":    float(v[-1]),
+        f"{prefix}_skew":   float(skew),
     }
 
 
@@ -127,10 +187,11 @@ def community_structure_stats(
     (community_label_propagation()'s membership, the network's realized
     structure). Call this twice with different `label`s to compare both.
 
-    Pass `edges_arr` (the (m,2) int64 directed edgelist from _edge_array)
-    to avoid re-extracting it from G on every call -- compute_metrics does
-    this once and hands the same array to both invocations. If omitted, it
-    is extracted here (same result, just not shared).
+    Pass `edges_arr`, the (m, 2) directed edgelist. This should be the SAME
+    array that was used to build G: igraph preserves edge insertion order,
+    so reading the edgelist back out of G reconstructs a bit-identical copy
+    of it at real cost (~5 s at 3.5M edges). If omitted it is read back out
+    of G, which is correct but wasteful.
 
     For every ordered pair of observed communities (i, j):
         e_ij                     raw directed edge count from i to j
@@ -149,6 +210,10 @@ def community_structure_stats(
     relevant denominator is 0 are excluded from that stat's distribution
     (not coerced to 0), so a handful of degree-0 communities don't distort
     the density_by_degree quartiles.
+
+    Only the at-most-min(m, k^2) pairs that actually carry an edge are
+    materialized; every other pair contributes an exact zero, folded into
+    the summary statistics analytically by _dist_stats_with_zeros.
     """
     n = G.vcount()
     comm_ids, sizes = np.unique(community_compact, return_counts=True)
@@ -158,43 +223,62 @@ def community_structure_stats(
     node_comm_idx = np.searchsorted(comm_ids, community_compact)
 
     if edges_arr is None:
-        edges_arr = _edge_array(G)
-    src_idx = node_comm_idx[edges_arr[:, 0]] if len(edges_arr) else np.empty(0, dtype=np.int64)
-    dst_idx = node_comm_idx[edges_arr[:, 1]] if len(edges_arr) else np.empty(0, dtype=np.int64)
+        edges_arr = np.asarray(G.get_edgelist(), dtype=np.int64)
 
-    e_matrix = np.zeros((k, k), dtype=np.int64)
-    if len(edges_arr):
-        np.add.at(e_matrix, (src_idx, dst_idx), 1)
+    tot_deg = np.asarray(G.degree(mode="all"), dtype=np.int64) if n else np.empty(0, np.int64)
+    deg_sum = (np.bincount(node_comm_idx, weights=tot_deg, minlength=k)
+               if n else np.zeros(k, dtype=np.float64))
 
-    tot_deg = np.asarray(G.degree(mode="all"), dtype=np.int64) if n else np.empty(0, dtype=np.int64)
-    deg_sum = np.bincount(node_comm_idx, weights=tot_deg, minlength=k) if n else np.zeros(k)
-
-    size_outer = np.outer(sizes, sizes).astype(np.float64)
-    min_outer  = np.minimum.outer(sizes, sizes).astype(np.float64)
-    deg_outer  = np.outer(deg_sum, deg_sum).astype(np.float64)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        density_size = np.where(size_outer > 0, e_matrix / size_outer, np.nan)
-        density_min  = np.where(min_outer  > 0, e_matrix / min_outer,  np.nan)
-        density_deg  = np.where(deg_outer  > 0, e_matrix / deg_outer,  np.nan)
-
-    inter_mask = ~np.eye(k, dtype=bool)
-    intra_mask = np.eye(k, dtype=bool)
-
-    def _finite(mat, mask):
-        vals = mat[mask]
-        return vals[np.isfinite(vals)]
+    n_inter_pairs = k * k - k
+    n_intra_pairs = k
 
     rec = {f"{label}_n_observed": float(k)}
-    for name, mat in [
-        ("edges",              e_matrix.astype(np.float64)),
-        ("density_by_size",    density_size),
-        ("density_by_minsize", density_min),
-        ("density_by_degree",  density_deg),
-    ]:
-        rec.update(dist_stats(_finite(mat, inter_mask), f"{label}_{name}_inter"))
-        rec.update(dist_stats(_finite(mat, intra_mask), f"{label}_{name}_intra"))
 
+    if len(edges_arr) == 0:
+        for name in ("edges", "density_by_size", "density_by_minsize", "density_by_degree"):
+            for sfx, npairs in (("inter", n_inter_pairs), ("intra", n_intra_pairs)):
+                rec.update(_dist_stats_with_zeros(np.empty(0), npairs, f"{label}_{name}_{sfx}"))
+        return rec
+
+    # Observed (i, j) pairs only. k <= n <= ~9e5 so k*k fits comfortably in
+    # int64 and the pair code is exact.
+    src = node_comm_idx[edges_arr[:, 0]].astype(np.int64)
+    dst = node_comm_idx[edges_arr[:, 1]].astype(np.int64)
+    codes, counts = np.unique(src * k + dst, return_counts=True)
+    del src, dst
+    ci, cj = codes // k, codes % k
+    diag = ci == cj
+
+    counts = counts.astype(np.float64)
+    si, sj = sizes[ci].astype(np.float64), sizes[cj].astype(np.float64)
+    di, dj = deg_sum[ci], deg_sum[cj]
+
+    # Pairs dropped from density_by_degree because a community has total
+    # degree 0. Isolated nodes are removed by load_edges, so in practice
+    # z == 0 and nothing is excluded; handled for completeness.
+    z = int((deg_sum == 0).sum())
+    excl_inter = n_inter_pairs - ((k - z) ** 2 - (k - z))
+    excl_intra = z
+
+    ok_deg = (di * dj) > 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dens_deg = np.where(ok_deg, counts / (di * dj), np.nan)
+
+    series = [
+        ("edges",              counts,                      0,          0,          None),
+        ("density_by_size",    counts / (si * sj),          0,          0,          None),
+        ("density_by_minsize", counts / np.minimum(si, sj), 0,          0,          None),
+        ("density_by_degree",  dens_deg,                    excl_inter, excl_intra, ok_deg),
+    ]
+    for name, vals, ex_inter, ex_intra, keep in series:
+        for msk, sfx, npairs, excl in (( ~diag, "inter", n_inter_pairs, ex_inter),
+                                       (  diag, "intra", n_intra_pairs, ex_intra)):
+            m_ = msk if keep is None else (msk & keep)
+            v = vals[m_]
+            # implicit zeros = all pairs, less those excluded by a zero
+            # denominator, less the observed pairs held explicitly
+            rec.update(_dist_stats_with_zeros(v, npairs - excl - len(v),
+                                              f"{label}_{name}_{sfx}"))
     return rec
 
 
@@ -214,7 +298,7 @@ def compute_metrics(edges: np.ndarray, community_compact: np.ndarray | None = No
     coreness    = np.asarray(G.coreness(mode="all"),  dtype=np.int32)
     pagerank    = np.asarray(G.pagerank(directed=True), dtype=np.float64)
     knn_vals, _ = G.knn()
-    knn = np.asarray([v if v is not None else 0.0 for v in knn_vals], dtype=np.float64)
+    knn = np.nan_to_num(np.asarray(knn_vals, dtype=np.float64), nan=0.0)
 
     weak    = G.connected_components(mode="weak")
     weak_m  = np.asarray(weak.membership)
@@ -244,7 +328,12 @@ def compute_metrics(edges: np.ndarray, community_compact: np.ndarray | None = No
         'frac_sinks':             float((out_deg == 0).mean()) if n else 0.0,
         'frac_degree_1':          float((tot_deg == 1).mean()) if n else 0.0,
         'global_clustering':      float(G.transitivity_undirected(mode="zero")),
-        'avg_local_clustering':   float(G.transitivity_avglocal_undirected(mode="zero")),
+        # transitivity_avglocal_undirected(mode="zero") is by definition the
+        # mean of transitivity_local_undirected(mode="zero"), already
+        # computed above. Calling it would re-run the triangle enumeration,
+        # whose cost scales with sum(d_i^2) -- the single most expensive
+        # igraph call here on a hub-heavy graph.
+        'avg_local_clustering':   float(local_clust.mean()) if n else 0.0,
         'reciprocity':            float(G.reciprocity()),
         'density':                float(G.density()),
         'max_coreness':           int(coreness.max()) if n else 0,
@@ -259,31 +348,34 @@ def compute_metrics(edges: np.ndarray, community_compact: np.ndarray | None = No
     if n > 1:
         sub = G if is_weak else G.induced_subgraph(np.where(weak_m == lcc_id)[0].tolist())
         start = np.random.randint(sub.vcount())
-        d1 = sub.distances(source=start, mode="all")[0]
-        far1 = int(np.argmax([x if x != float('inf') else -1 for x in d1]))
-        d2 = sub.distances(source=far1, mode="all")[0]
-        rec['approx_diameter'] = int(max(x for x in d2 if x != float('inf')))
+        # sub is weakly connected and distances() uses mode="all", so no
+        # entry is actually infinite; the guards below are belt-and-braces.
+        d1 = np.asarray(sub.distances(source=start, mode="all")[0], dtype=np.float64)
+        far1 = int(np.argmax(np.where(np.isfinite(d1), d1, -1.0)))
+        d2 = np.asarray(sub.distances(source=far1, mode="all")[0], dtype=np.float64)
+        finite = d2[np.isfinite(d2)]
+        rec['approx_diameter'] = int(finite.max()) if len(finite) else 0
     else:
         rec['approx_diameter'] = 0
 
-    # Extracted lazily on first need, then shared by both
-    # community_structure_stats calls instead of being re-extracted from G
-    # each time. Stays None if neither call happens (e.g. a BIG graph with
-    # no community file), so we don't pay for it needlessly.
-    edges_arr = None
+    # The array that built G. igraph preserves edge insertion order, so
+    # reading the edgelist back out of G would reconstruct a bit-identical
+    # copy of this at real cost -- just reuse it. Indices stay int32; the
+    # int64 promotion happens inside community_structure_stats only where
+    # the pair code needs it.
+    edges_arr = edges
 
     if n < BIG:
         und = G.as_undirected(mode="collapse")
         part = und.community_label_propagation()
-        rec['modularity']      = float(und.modularity(part))
-        rec['num_communities'] = len(set(part.membership))
+        rec['modularity']      = float(part.modularity)   # cached on the clustering
+        rec['num_communities'] = len(part)                # O(1), no set over |V|
 
         # Topology-DETECTED communities -- membership is already in G's own
         # node-index space (as_undirected() doesn't reorder vertices), so
         # this needs nothing external: no nodes.parquet, no community_id,
         # no reindexing. Measures the network's REALIZED structure.
-        detected = np.asarray(part.membership, dtype=np.int64)
-        edges_arr = _edge_array(G)
+        detected = np.fromiter(part.membership, dtype=np.int64, count=und.vcount())
         rec.update(community_structure_stats(G, detected, label="detected_community",
                                              edges_arr=edges_arr))
     else:
@@ -296,8 +388,6 @@ def compute_metrics(edges: np.ndarray, community_compact: np.ndarray | None = No
     # generated to have, which can differ from what label propagation
     # detects above.
     if community_compact is not None and len(community_compact) == n and n > 0:
-        if edges_arr is None:
-            edges_arr = _edge_array(G)
         rec.update(community_structure_stats(G, community_compact, label="assigned_community",
                                              edges_arr=edges_arr))
 
