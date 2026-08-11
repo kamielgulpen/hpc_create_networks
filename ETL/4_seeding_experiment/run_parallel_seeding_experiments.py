@@ -38,7 +38,7 @@ def discover_network_ids() -> list[str]:
     return sorted(
         p.name for p in net_dir.iterdir()
         if p.is_dir() 
-        and "werkschool" in p.name 
+        and "buren" in p.name 
         and (p / 'edges.npz').exists()
     )
 
@@ -57,6 +57,7 @@ def discover_ks(aggregations: list[tuple[str, str, str]]) -> list[int]:
     ks = {}
     for aggregation in aggregations:
        df = pd.read_parquet(data_lake.ROOT / 'aggregation_levels' / aggregation[0]/ 'mixing_features.parquet')
+       print(df)
        k = df[df["feature_name"] == f"{aggregation[1]}_degree_node_mean"]["feature_value"].iloc[0]
        ks[aggregation[2]] = int(k)
     return ks
