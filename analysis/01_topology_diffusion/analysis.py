@@ -7,21 +7,23 @@ import matplotlib.pyplot as plt
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import LogNorm, Normalize, LinearSegmentedColormap
 
-
+LAYER = "werkschool"
 df = pd.read_parquet(dl.ROOT / "analysis_tables" / "full_table.parquet")
 
-print(df.head())
+df = df[df.network_id.str.contains(LAYER)]
 
+
+df = df[df["mix_population_hhi"].notna()]
 df['cc'] = df['network_id'].str.split('__').str[1]
 
-metrics = ['detected_community_edges_inter_mean', 'detected_community_density_by_minsize_inter_mean', 'coreness_skew', 'detected_community_edges_inter_skew', 'detected_community_density_by_minsize_inter_skew', 'global_clustering', 'detected_community_density_by_degree_intra_q25', 'detected_community_density_by_minsize_intra_skew', 'num_communities', 'detected_community_density_by_size_intra_mean']
+metrics = ["global_clustering", "detected_community_edges_inter_skew", "coreness_q75", "detected_community_density_by_size_intra_std", "detected_community_edges_intra_skew"]
 
 
-plt.scatter(df["mix_familie_homophily_coleman_mean"], df["mix_familie_hhi_overall"], c= "red")
-plt.scatter(df["mix_buren_homophily_coleman_mean"], df["mix_buren_hhi_overall"], c = "blue")
-plt.scatter(df["mix_werkschool_homophily_coleman_mean"], df["mix_werkschool_hhi_overall"], c = "green")
+# plt.scatter(df["mix_familie_homophily_coleman_mean"], df["mix_familie_hhi_overall"], c= "red")
+# plt.scatter(df["mix_buren_homophily_coleman_mean"], df["mix_buren_hhi_overall"], c = "blue")
+# plt.scatter(df["mix_werkschool_homophily_coleman_mean"], df["mix_werkschool_hhi_overall"], c = "green")
 
-plt.show()
+# plt.show()
 
 for i in df.columns:
     print(i)
@@ -286,7 +288,7 @@ def q1_summary(tbl):
 # ---- quick self-test on the mock data ----
 if __name__ == "__main__":
 
-    ridgeline(df, cols=metrics, hhi_col="mix_werkschool_homophily_raw", agg_col="cc",
+    ridgeline(df, cols=metrics, hhi_col="mix_population_hhi", agg_col="cc",
               out_path="ridge_simple.png")
     
     # ---- Q1 run ------------------------------------------------------------
