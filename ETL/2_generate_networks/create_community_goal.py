@@ -16,6 +16,7 @@ import os
 import tempfile
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import math                                          # new
 
 import pandas as pd
 from SALib.sample import latin
@@ -35,11 +36,14 @@ PREF_ATTACHMENT    = 0
 BRIDGE_PROBABILITY = 0.0
 POP                = 861000 * SCALE
 
+
 PROBLEM = {
     'num_vars': 2,
     'names':    ['n_communities', 'transitivity'],
-    'bounds':   [[1 / POP, 1.0]],
+    'bounds':   [[math.log10(1 / POP), math.log10(1.0)],   # log10 fraction
+                 [0.0, 1.0]],                              # transitivity
 }
+
 
 AGG_LEVEL   = 'etngrp_geslacht_lft_oplniv'
 WRITE_EVERY = 1  # checkpoint the per-layer parquet every N completed tasks
@@ -49,6 +53,8 @@ def get_or_create_samples() -> pd.DataFrame:
     if data_lake.samples_exist():
         return data_lake.read_samples()
     samples = latin.sample(PROBLEM, N_SAMPLES, seed=RANDOM_SEED)
+    samples[:, 0] = 10.0 ** samples[:, 0]    
+    
     df = pd.DataFrame(samples, columns=PROBLEM['names'])
     df.insert(0, 'sample_id', df.index)
     df.insert(3, 'optimize', 0)
