@@ -77,8 +77,6 @@ def _default_root(PROJECT_ROOT: str | None = None) -> Path:
 # PROJECT_ROOT = "/home/you/pawn_project" on Linux/mac. Leave as None to
 # fall back to DATA_LAKE_ROOT / the file-relative default (see above).
 
-from pathlib import Path
-
 # Gets the folder containing the running script
 current_folder = Path(__file__).resolve().parent
 

@@ -24,9 +24,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+import os
+
+os.environ.setdefault("PIPELINE_SCALE", "0.10")
+
 import data_lake
 
-N_SAMPLES = 600
+N_SAMPLES = 10
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 def run_task(task_id: int, script: str, python: str, logs_dir: Path) -> tuple[int, int]:
@@ -57,7 +61,7 @@ def main():
     logs_dir.mkdir(exist_ok=True)
 
     print(f"Starting {args.tasks} tasks at {datetime.now()}")
-
+    print(data_lake.ROOT)
     completed = 0
     failures = []
 

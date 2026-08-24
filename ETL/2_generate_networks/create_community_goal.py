@@ -27,7 +27,6 @@ import data_lake
 
 # Must match the generation settings, or the loss isn't comparable.
 SCALE               = 0.01
-ISOLATION_THRESHOLD = 0.8
 REFINE_SWAPS        = 1000000
 
 N_SAMPLES          = int(N_SAMPLES/2)
@@ -75,7 +74,6 @@ def loss_for_fraction(pops_path, links_path, fraction):
             scale=SCALE,
             fraction_of_communities=fraction,
             output_path=tmp,
-            isolation_threshold=ISOLATION_THRESHOLD,
             refine_swaps=REFINE_SWAPS,
         )[1])
     finally:

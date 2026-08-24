@@ -31,7 +31,7 @@ import data_lake
 # =============================================================================
 
 
-SCALE           = float(os.environ.get("PIPELINE_SCALE", "0.01"))
+SCALE           = float(os.environ.get("PIPELINE_SCALE", "0.10"))
 RECIPROCITY_P   = 1
 RANDOM_SEED     = 42
 BRIDGE_PROBABILITY = 0.0
@@ -105,6 +105,7 @@ def discover_aggregation_levels() -> list[str]:
 
         agg_level_id = level_dir.name
         if agg_level_id not in ALLOWED_EXCEPTIONS:
+            continue
             if any(t in agg_level_id for t in EXCLUDED_SUBSTRINGS):
                 continue
 
@@ -213,8 +214,8 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
                   pops_path: str, links_path: str,
                   loss_goal: float | None = None) -> None:
 
-    ncom = float(params['n_communities'])
-    tr   = float(params['transitivity'])
+    ncom = round(float(params['n_communities']), 2)
+    tr   = round(float(params['transitivity']), 2)
     opt  = int(params['optimize'])
 
     print(ncom, tr, opt)
@@ -226,7 +227,7 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
     cc_goal = loss_goal if loss_goal is not None else float('-inf')
 
     run_id     = f'sample_{sample_id:05d}'
-    network_id = f'{run_id}__{agg_level_id}__{layer}'
+    network_id = f'{run_id}__{agg_level_id}__{layer}__ncom_{ncom}__tr_{tr}__opt_{opt}'
     net_dir    = data_lake.network_dir(network_id)
     edges_file = net_dir / 'edges.npz'
 
@@ -244,6 +245,7 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
         # fresh with create_communities(). CLONE_FROM_SCALE opts in; a missing
         # per-network source falls back to create_communities().
         src_nodes = clone_source_nodes_path(network_id)
+        src_nodes = None
         clone_used = False
         if src_nodes is not None:
             # clone_communities returns (path, cloned_loss). It reuses THIS
@@ -269,7 +271,6 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
                 scale=SCALE,
                 fraction_of_communities=ncom,
                 output_path=communities_path,
-                isolation_threshold=0.8,
                 refine_swaps=refine_swaps,
                 loss_goal=cc_goal,
             )[1]
@@ -381,7 +382,7 @@ def main():
                 continue
 
             for layer in layers:
-                if layer in ('huishouden',):
+                if layer in ('huishouden', 'familie'):
                     continue
 
                 loss_goal = reference_losses.get((sample_id, layer))
