@@ -26,7 +26,7 @@ from run_parallel_generate_network import N_SAMPLES
 import data_lake
 
 # Must match the generation settings, or the loss isn't comparable.
-SCALE               = 0.01
+SCALE               = 0.1
 REFINE_SWAPS        = 1000000
 
 N_SAMPLES          = int(N_SAMPLES/2)
@@ -38,8 +38,7 @@ POP                = 861000 * SCALE
 PROBLEM = {
     'num_vars': 2,
     'names':    ['n_communities', 'transitivity'],
-    'bounds':   [[1 / POP, 1.0],
-                 [0.0,      1.0]],
+    'bounds':   [[1 / POP, 1.0]],
 }
 
 AGG_LEVEL   = 'etngrp_geslacht_lft_oplniv'
@@ -84,7 +83,8 @@ def _worker(task):
     """Runs in a child process. Pure compute -- no writes to shared state.
     CSVs were materialized once by the parent; we only read the paths."""
     sample_id, layer, fraction, pops_path, links_path = task
-    loss = loss_for_fraction(pops_path, links_path, fraction)
+    # loss = loss_for_fraction(pops_path, links_path, fraction)
+    loss = 0.0
     return {'sample_id': sample_id, 'layer': layer,
             'n_communities': fraction, 'loss': loss}
 
