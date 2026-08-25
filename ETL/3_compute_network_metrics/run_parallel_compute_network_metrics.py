@@ -34,7 +34,7 @@ def discover_network_ids() -> list[str]:
     net_dir = data_lake.ROOT / 'networks'
     if not net_dir.exists():
         return []
-    return sorted(p.name for p in net_dir.iterdir() if p.is_dir() and (p / 'edges.npz').exists())
+    return sorted(p.name for p in net_dir.iterdir() if p.is_dir() and "ncom" in p.name and (p / 'edges.npz').exists())
 
 
 def already_done(network_id: str) -> bool:

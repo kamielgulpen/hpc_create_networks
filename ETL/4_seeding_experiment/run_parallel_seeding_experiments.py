@@ -38,7 +38,7 @@ def discover_network_ids() -> list[str]:
     return sorted(
         p.name for p in net_dir.iterdir()
         if p.is_dir() 
-        and "buren" in p.name 
+        and "ncom" in p.name 
         and (p / 'edges.npz').exists()
     )
 
