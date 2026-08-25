@@ -214,8 +214,8 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
                   pops_path: str, links_path: str,
                   loss_goal: float | None = None) -> None:
 
-    ncom = round(float(params['n_communities']), 2)
-    tr   = round(float(params['transitivity']), 2)
+    ncom = float(params['n_communities'])
+    tr   = float(params['transitivity'])
     opt  = int(params['optimize'])
 
     print(ncom, tr, opt)
@@ -227,7 +227,7 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
     cc_goal = loss_goal if loss_goal is not None else float('-inf')
 
     run_id     = f'sample_{sample_id:05d}'
-    network_id = f'{run_id}__{agg_level_id}__{layer}__ncom_{ncom}__tr_{tr}__opt_{opt}'
+    network_id = f'{run_id}__{agg_level_id}__{layer}__ncom_{round(ncom, 2)}__tr_{round(tr,2)}__opt_{round(opt,2)}'
     net_dir    = data_lake.network_dir(network_id)
     edges_file = net_dir / 'edges.npz'
 
