@@ -36,7 +36,6 @@ PREF_ATTACHMENT    = 0
 BRIDGE_PROBABILITY = 0.0
 POP                = 861000 * SCALE
 
-print(N_SAMPLES, RANDOM_SEED, PREF_ATTACHMENT, BRIDGE_PROBABILITY, POP)
 PROBLEM = {
     'num_vars': 2,
     'names':    ['n_communities', 'transitivity'],
@@ -89,7 +88,7 @@ def _worker(task):
     """Runs in a child process. Pure compute -- no writes to shared state.
     CSVs were materialized once by the parent; we only read the paths."""
     sample_id, layer, fraction, pops_path, links_path = task
-    # loss = loss_for_fraction(pops_path, links_path, fraction)
+    loss = loss_for_fraction(pops_path, links_path, fraction)
     loss = 0.0
     return {'sample_id': sample_id, 'layer': layer,
             'n_communities': fraction, 'loss': loss}
