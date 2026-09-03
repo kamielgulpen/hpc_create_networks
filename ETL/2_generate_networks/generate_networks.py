@@ -105,7 +105,6 @@ def discover_aggregation_levels() -> list[str]:
 
         agg_level_id = level_dir.name
         if agg_level_id not in ALLOWED_EXCEPTIONS:
-            continue
             if any(t in agg_level_id for t in EXCLUDED_SUBSTRINGS):
                 continue
 
@@ -382,7 +381,7 @@ def main():
                 continue
 
             for layer in layers:
-                if layer in ('huishouden', 'familie'):
+                if layer in ('huishouden'):
                     continue
 
                 loss_goal = reference_losses.get((sample_id, layer))

@@ -36,7 +36,7 @@ PREF_ATTACHMENT    = 0
 BRIDGE_PROBABILITY = 0.0
 POP                = 861000 * SCALE
 
-
+print(N_SAMPLES, RANDOM_SEED, PREF_ATTACHMENT, BRIDGE_PROBABILITY, POP)
 PROBLEM = {
     'num_vars': 2,
     'names':    ['n_communities', 'transitivity'],
