@@ -34,7 +34,7 @@ import data_lake
 # =============================================================================
 
 
-SCALE           = float(os.environ.get("PIPELINE_SCALE", "0.01"))
+SCALE           = float(os.environ.get("PIPELINE_SCALE", "1.00"))
 RECIPROCITY_P   = 1
 RANDOM_SEED     = 42
 BRIDGE_PROBABILITY = 0.0

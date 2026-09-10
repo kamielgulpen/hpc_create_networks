@@ -16,8 +16,13 @@ from __future__ import annotations
 
 import itertools
 
+
 import pandas as pd
 
+from pathlib import Path
+import sys
+LAKE_DIR = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(1, str(LAKE_DIR))
 import data_lake
 
 VARS = ["etngrp", "geslacht", "lft", "oplniv"]
