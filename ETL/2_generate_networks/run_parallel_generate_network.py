@@ -19,18 +19,20 @@ Usage:
 
 import argparse
 import subprocess
-import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
 import os
 
-os.environ.setdefault("PIPELINE_SCALE", "0.10")
+os.environ.setdefault("PIPELINE_SCALE", "0.01")
 
+import sys
+LAKE_DIR = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(1, str(LAKE_DIR))
 import data_lake
 
-N_SAMPLES = 300
+N_SAMPLES = 1000
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 def run_task(task_id: int, script: str, python: str, logs_dir: Path) -> tuple[int, int]:

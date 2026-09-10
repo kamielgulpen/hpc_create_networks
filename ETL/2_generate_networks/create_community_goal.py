@@ -13,6 +13,7 @@ data_lake.py.
 
 import argparse
 import os
+from pathlib import Path
 import tempfile
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -23,11 +24,14 @@ from SALib.sample import latin
 
 from asnu import create_communities
 from run_parallel_generate_network import N_SAMPLES
-
+import sys
+LAKE_DIR = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(1, str(LAKE_DIR))
 import data_lake
 
+
 # Must match the generation settings, or the loss isn't comparable.
-SCALE               = 0.1
+SCALE               = 0.01
 REFINE_SWAPS        = 1000000
 
 N_SAMPLES          = int(N_SAMPLES/2)
@@ -88,7 +92,7 @@ def _worker(task):
     """Runs in a child process. Pure compute -- no writes to shared state.
     CSVs were materialized once by the parent; we only read the paths."""
     sample_id, layer, fraction, pops_path, links_path = task
-    loss = loss_for_fraction(pops_path, links_path, fraction)
+    # loss = loss_for_fraction(pops_path, links_path, fraction)
     loss = 0.0
     return {'sample_id': sample_id, 'layer': layer,
             'n_communities': fraction, 'loss': loss}

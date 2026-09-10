@@ -23,15 +23,18 @@ import numpy as np
 import pandas as pd
 
 from asnu import generate, create_communities, clone_communities
-
+import sys
+LAKE_DIR = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(1, str(LAKE_DIR))
 import data_lake
+
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
 
-SCALE           = float(os.environ.get("PIPELINE_SCALE", "0.10"))
+SCALE           = float(os.environ.get("PIPELINE_SCALE", "0.01"))
 RECIPROCITY_P   = 1
 RANDOM_SEED     = 42
 BRIDGE_PROBABILITY = 0.0
@@ -54,11 +57,11 @@ EXCLUDED_SUBSTRINGS = (
     'arbeidsstatus',
     'uitkeringstype',
     'burgerlijke_staat',
-    # 'lft',
-    # 'etngrp',
-    # 'geslacht',
-    # 'etngrp',
-    # 'oplniv'
+    'lft',
+    'etngrp',
+    'geslacht',
+    'etngrp',
+    'oplniv'
 
 )
 ALLOWED_EXCEPTIONS = {
@@ -246,7 +249,7 @@ def generate_one(sample_id: int, params: pd.Series, agg_level_id: str, layer: st
         src_nodes = clone_source_nodes_path(network_id)
         src_nodes = None
         clone_used = False
-        if src_nodes is not None:
+        if src_nodes is not None and CLONE_FROM_SCALE  :
             # clone_communities returns (path, cloned_loss). It reuses THIS
             # network's small-scale partition, scaling per-group counts (which
             # are not exact multiples of the small scale) via reconciliation.

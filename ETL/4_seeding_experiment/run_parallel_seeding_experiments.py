@@ -21,12 +21,13 @@ import os
 import re
 import subprocess
 import sys
+LAKE_DIR = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(1, str(LAKE_DIR))
+import data_lake
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
-
-import data_lake
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 

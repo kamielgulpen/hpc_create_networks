@@ -18,7 +18,11 @@ Requires: pip install polars
 """
 
 import polars as pl
+from pathlib import Path
 
+import sys
+LAKE_DIR = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(1, str(LAKE_DIR))
 import data_lake as dl
 
 ANALYSIS_DIR_NAME = "analysis_tables"

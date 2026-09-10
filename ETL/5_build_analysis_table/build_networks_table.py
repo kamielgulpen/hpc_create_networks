@@ -20,6 +20,9 @@ from pathlib import Path
 import pandas as pd
 import polars as pl
 
+import sys
+LAKE_DIR = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(1, str(LAKE_DIR))
 import data_lake as dl
 
 OUT_FILENAME = "networks_table.parquet"
