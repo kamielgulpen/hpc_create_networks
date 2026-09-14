@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 LAKE_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(1, str(LAKE_DIR))
 import data_lake

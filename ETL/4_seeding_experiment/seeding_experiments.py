@@ -33,6 +33,7 @@ import gc
 import os
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 from typing import Optional
 
 import numba
@@ -40,6 +41,9 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 
+from pathlib import Path
+LAKE_DIR = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(1, str(LAKE_DIR))
 import data_lake
 
 
