@@ -132,7 +132,7 @@ def compute_ignition_probability(ignition_threshold_fraction: float = 0.5,
 
 
 def run(ignition_threshold_fraction: float = 0.5, save: bool = True) -> pl.DataFrame:
-    result = compute_ignition_probability(ignition_threshold_fraction)
+    result = compute_ignition_probability(ignition_threshold_fraction, 3)
 
     # Force any large intermediates (per_sim, the raw scan buffers) to
     # actually be freed before the write allocates anything new. Python's
