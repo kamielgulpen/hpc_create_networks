@@ -32,7 +32,7 @@ LAKE_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(1, str(LAKE_DIR))
 import data_lake
 
-N_SAMPLES = 1000
+N_SAMPLES = 100
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 def run_task(task_id: int, script: str, python: str, logs_dir: Path) -> tuple[int, int]:
