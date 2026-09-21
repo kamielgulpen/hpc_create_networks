@@ -35,6 +35,7 @@ SCALE               = 0.01
 REFINE_SWAPS        = 1000000
 
 N_SAMPLES          = int(N_SAMPLES/2)
+print(f"Using {N_SAMPLES} samples for the community loss reference")
 RANDOM_SEED        = 42
 PREF_ATTACHMENT    = 0
 BRIDGE_PROBABILITY = 0.0
@@ -92,8 +93,8 @@ def _worker(task):
     """Runs in a child process. Pure compute -- no writes to shared state.
     CSVs were materialized once by the parent; we only read the paths."""
     sample_id, layer, fraction, pops_path, links_path = task
-    # loss = loss_for_fraction(pops_path, links_path, fraction)
-    loss = 0.0
+    loss = loss_for_fraction(pops_path, links_path, fraction)
+    # loss = 0.0
     return {'sample_id': sample_id, 'layer': layer,
             'n_communities': fraction, 'loss': loss}
 
