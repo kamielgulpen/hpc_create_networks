@@ -1,539 +1,153 @@
+#!/usr/bin/env python3
 """
-Stage: compute topological features for every generated network.
+Pure-Python parallel runner for the network-metrics stage, replacing
+run_compute_metrics_locally.sh.
 
-Reads networks/{network_id}/edges.npz from the data lake, computes
-graph-theoretic metrics with igraph, and merges them into
-networks/{network_id}/network_stats.parquet -- alongside the basic
-n_nodes/n_edges/gen_time_s that PAWN_analysis.py already wrote there during
-generation. This is the "Compute topological features" step in the general
-pipeline; results land directly in network_stats, queryable immediately,
-no separate aggregate-into-one-big-csv step needed afterward.
+Runs `python compute_metrics.py --network_id X` once per network in the
+data lake that has an edges.npz, up to --max_parallel at a time, logging
+each task's stdout/stderr to its own file under logs_metrics/. Same
+concurrency model as run_parallel_generation.py: every task is a fully
+separate OS process -- important here specifically, since a single huge
+network's igraph computation crashing or exhausting memory shouldn't take
+the whole batch down with it.
 
-If networks/{network_id}/nodes.parquet has a 'community_id' column (see
-PAWN_analysis.py's load_node_communities()), also computes inter/intra
-community structure stats: for every pair of communities (i, j), the raw
-edge count e_ij plus three normalizations (by n_i*n_j, by min(n_i,n_j), by
-community total-degree product), summarized as mean/std/min/quartiles/max
-across all pairs -- separately for inter-community (i != j) and
-intra-community (i == j) pairs, so quartiles reflect mixing structure
-rather than being an artifact of community-size differences.
+With `--only assortativity`, runs the assortativity backfill instead
+(`compute_network_metrics.py --only assortativity`): only networks that
+don't yet have assortativity stats are processed, and nothing else in
+their network_stats is recomputed. Logs go to logs/metrics_assortativity.
 
-One network per invocation, selected by --network_id or --task_id (index
-into the sorted list of all networks that have an edges.npz). Run many of
-these in parallel with run_parallel_compute_network_metrics.py.
-
-PERFORMANCE NOTE (see community_structure_stats): the pair statistics are
-computed from a sparse representation of the community-by-community edge
-matrix. The previous implementation materialized seven dense k x k float64
-arrays plus two k x k boolean masks, which is O(k^2) in both time and
-memory: ~27 s and ~2.8 GB at k=5,000, and ~22 GB (unschedulable) at
-k=20,000. k is not bounded by anything in this pipeline -- label
-propagation on a sparse graph routinely returns tens of thousands of
-labels -- so that was a hard ceiling, not just a slow path. The current
-version is O(m log m) and flat in k. Output is unchanged to within 1e-9 on
-every emitted statistic.
+Usage:
+    python run_parallel_metrics.py
+    python run_parallel_metrics.py --max_parallel 5
+    python run_parallel_metrics.py --only assortativity --max_parallel 10
 """
 
 import argparse
-import gc
-import json
-import os
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 
-import igraph as ig
-import numpy as np
 import pandas as pd
-from scipy import stats
 import sys
 LAKE_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(1, str(LAKE_DIR))
 import data_lake
 
-BIG = 900_000
+SCRIPT_DIR = Path(__file__).resolve().parent
 
-_STAT_KEYS = ["mean", "std", "min", "q25", "median", "q75", "max", "skew"]
-
-
-def load_edges(npz_file: Path) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Returns:
-        edges        : (m, 2) int32 -- deduplicated, self-loop-free, and
-                        REINDEXED to a compact 0..k-1 space, where k is the
-                        number of distinct nodes that appear in at least
-                        one edge. Isolated nodes are dropped entirely --
-                        they're not part of this space at all.
-        original_ids : (k,) int32 -- original_ids[i] is the ORIGINAL
-                        positional node index (matching the row order of
-                        nodes.parquet / edges_from_nx()'s numbering in
-                        PAWN_analysis.py) that compact index i refers to.
-                        Needed to correctly join anything from
-                        nodes.parquet (like community_id) onto this graph.
-    """
-    with np.load(npz_file, allow_pickle=True) as data:
-        arr = np.asarray(data[list(data.keys())[0]])
-    if arr.ndim == 2 and arr.shape[0] == 2 and arr.shape[1] != 2:
-        arr = arr.T
-    if arr.ndim != 2 or arr.shape[1] != 2:
-        raise ValueError(f"bad shape {arr.shape}")
-
-    edges = np.ascontiguousarray(arr, dtype=np.int64)
-    edges = edges[edges[:, 0] != edges[:, 1]]
-    if len(edges) == 0:
-        return edges.astype(np.int32), np.empty(0, dtype=np.int32)
-
-    # Directed: don't sort axis=1
-    packed = (edges[:, 0].astype(np.uint64) << 32) | edges[:, 1].astype(np.uint64)
-    packed = np.unique(packed)
-    edges = np.empty((len(packed), 2), dtype=np.int32)
-    edges[:, 0] = (packed >> 32).astype(np.int32)
-    edges[:, 1] = (packed & 0xFFFFFFFF).astype(np.int32)
-
-    original_ids, inv = np.unique(edges.ravel(), return_inverse=True)
-    return inv.reshape(-1, 2).astype(np.int32), original_ids.astype(np.int32)
-
-
-def dist_stats(x, prefix):
-    if len(x) == 0:
-        return {f"{prefix}_{k}": 0.0 for k in _STAT_KEYS}
-    return {
-        f"{prefix}_mean":   float(np.mean(x)),
-        f"{prefix}_std":    float(np.std(x)),
-        f"{prefix}_min":    float(np.min(x)),
-        f"{prefix}_q25":    float(np.quantile(x, 0.25)),
-        f"{prefix}_median": float(np.median(x)),
-        f"{prefix}_q75":    float(np.quantile(x, 0.75)),
-        f"{prefix}_max":    float(np.max(x)),
-        f"{prefix}_skew":   float(stats.skew(x)),
-    }
-
-
-def _dist_stats_with_zeros(vals, n_zeros, prefix):
-    """dist_stats over `vals` plus `n_zeros` implicit zeros.
-
-    Exact, not approximate -- this reproduces what dist_stats() would
-    return if you actually built the array of n_zeros zeros followed by
-    vals, which is what the dense k x k formulation did. Two things make
-    that avoidable:
-
-      - mean/std/skew need only the sum, and the 2nd and 3rd central
-        moments; each omitted zero sits at distance -mean from the mean and
-        so contributes a known amount to each.
-      - the zeros are all at the bottom of the sorted array, so a quantile
-        either lands inside the zero block (and is 0) or inside the sorted
-        nonzeros. This matches numpy's default 'linear' interpolation.
-
-    Central moments rather than raw power sums: `s2/N - mean**2` loses
-    about eight significant digits when the variance is small relative to
-    mean**2, which is exactly the intra-community edge-count case (large
-    counts, tight spread, no implicit zeros).
-
-    scipy.stats.skew returns nan for zero-variance input, so a constant
-    distribution (e.g. a network with no intra-community edges at all,
-    where every intra pair is 0) yields skew=nan. That is the pre-existing
-    behavior and is reproduced here rather than quietly coerced to 0.0.
-    """
-    nnz = len(vals)
-    N = nnz + n_zeros
-    if N == 0:                       # dist_stats' empty branch
-        return {f"{prefix}_{k}": 0.0 for k in _STAT_KEYS}
-    if nnz == 0:                     # every value is an implicit zero
-        rec = {f"{prefix}_{k}": 0.0 for k in _STAT_KEYS}
-        rec[f"{prefix}_skew"] = float("nan")
-        return rec
-
-    v = np.sort(np.asarray(vals, dtype=np.float64))
-    mean = float(v.sum()) / N
-    d = v - mean
-    m2 = (float(d @ d) + n_zeros * mean ** 2) / N
-    m3 = (float((d * d) @ d) - n_zeros * mean ** 3) / N
-    std = np.sqrt(max(m2, 0.0))
-    skew = float("nan") if m2 <= 0 else m3 / m2 ** 1.5
-
-    def _at(i):
-        if i < n_zeros:
-            return 0.0
-        j = i - n_zeros
-        return float(v[j]) if j < nnz else float(v[-1])
-
-    def _q(p):
-        pos = p * (N - 1)
-        lo = int(np.floor(pos))
-        frac = pos - lo
-        a = _at(lo)
-        b = _at(min(lo + 1, N - 1))
-        return a + frac * (b - a)
-
-    return {
-        f"{prefix}_mean":   float(mean),
-        f"{prefix}_std":    float(std),
-        f"{prefix}_min":    0.0 if n_zeros else float(v[0]),
-        f"{prefix}_q25":    float(_q(0.25)),
-        f"{prefix}_median": float(_q(0.50)),
-        f"{prefix}_q75":    float(_q(0.75)),
-        f"{prefix}_max":    float(v[-1]),
-        f"{prefix}_skew":   float(skew),
-    }
-
-
-def community_structure_stats(
-    G,
-    community_compact: np.ndarray,
-    label: str = "community",
-    edges_arr: np.ndarray | None = None,
-) -> dict:
-    """
-    Inter/intra-community edge structure for ANY per-node community
-    assignment aligned with G's node indices -- doesn't care whether that
-    assignment came from asnu's community file (the network's intended/
-    generative structure) or from topology-based community detection
-    (community_label_propagation()'s membership, the network's realized
-    structure). Call this twice with different `label`s to compare both.
-
-    Pass `edges_arr`, the (m, 2) directed edgelist. This should be the SAME
-    array that was used to build G: igraph preserves edge insertion order,
-    so reading the edgelist back out of G reconstructs a bit-identical copy
-    of it at real cost (~5 s at 3.5M edges). If omitted it is read back out
-    of G, which is correct but wasteful.
-
-    For every ordered pair of observed communities (i, j):
-        e_ij                     raw directed edge count from i to j
-        e_ij / (n_i * n_j)       density_by_size   -- comparable across
-                                  pairs regardless of community size
-        e_ij / min(n_i, n_j)     density_by_minsize -- normalizes by the
-                                  smaller side, useful when one community
-                                  is much bigger than the other
-        e_ij / (deg_i * deg_j)   density_by_degree -- normalized by each
-                                  community's total (in+out) degree, i.e.
-                                  relative to how much total connectivity
-                                  each community has, not just node count
-
-    Each is summarized with mean/std/min/quartiles/max/skew, separately
-    over i != j pairs (inter) and i == j pairs (intra). Pairs where the
-    relevant denominator is 0 are excluded from that stat's distribution
-    (not coerced to 0), so a handful of degree-0 communities don't distort
-    the density_by_degree quartiles.
-
-    Only the at-most-min(m, k^2) pairs that actually carry an edge are
-    materialized; every other pair contributes an exact zero, folded into
-    the summary statistics analytically by _dist_stats_with_zeros.
-    """
-    n = G.vcount()
-    comm_ids, sizes = np.unique(community_compact, return_counts=True)
-    k = len(comm_ids)
-
-    # compact community index per node, aligned with G's node order
-    node_comm_idx = np.searchsorted(comm_ids, community_compact)
-
-    if edges_arr is None:
-        edges_arr = np.asarray(G.get_edgelist(), dtype=np.int64)
-
-    tot_deg = np.asarray(G.degree(mode="all"), dtype=np.int64) if n else np.empty(0, np.int64)
-    deg_sum = (np.bincount(node_comm_idx, weights=tot_deg, minlength=k)
-               if n else np.zeros(k, dtype=np.float64))
-
-    n_inter_pairs = k * k - k
-    n_intra_pairs = k
-
-    rec = {f"{label}_n_observed": float(k)}
-
-    if len(edges_arr) == 0:
-        for name in ("edges", "density_by_size", "density_by_minsize", "density_by_degree"):
-            for sfx, npairs in (("inter", n_inter_pairs), ("intra", n_intra_pairs)):
-                rec.update(_dist_stats_with_zeros(np.empty(0), npairs, f"{label}_{name}_{sfx}"))
-        return rec
-
-    # Observed (i, j) pairs only. k <= n <= ~9e5 so k*k fits comfortably in
-    # int64 and the pair code is exact.
-    src = node_comm_idx[edges_arr[:, 0]].astype(np.int64)
-    dst = node_comm_idx[edges_arr[:, 1]].astype(np.int64)
-    codes, counts = np.unique(src * k + dst, return_counts=True)
-    del src, dst
-    ci, cj = codes // k, codes % k
-    diag = ci == cj
-
-    counts = counts.astype(np.float64)
-    si, sj = sizes[ci].astype(np.float64), sizes[cj].astype(np.float64)
-    di, dj = deg_sum[ci], deg_sum[cj]
-
-    # Pairs dropped from density_by_degree because a community has total
-    # degree 0. Isolated nodes are removed by load_edges, so in practice
-    # z == 0 and nothing is excluded; handled for completeness.
-    z = int((deg_sum == 0).sum())
-    excl_inter = n_inter_pairs - ((k - z) ** 2 - (k - z))
-    excl_intra = z
-
-    ok_deg = (di * dj) > 0
-    with np.errstate(divide="ignore", invalid="ignore"):
-        dens_deg = np.where(ok_deg, counts / (di * dj), np.nan)
-
-    series = [
-        ("edges",              counts,                      0,          0,          None),
-        ("density_by_size",    counts / (si * sj),          0,          0,          None),
-        ("density_by_minsize", counts / np.minimum(si, sj), 0,          0,          None),
-        ("density_by_degree",  dens_deg,                    excl_inter, excl_intra, ok_deg),
-    ]
-    for name, vals, ex_inter, ex_intra, keep in series:
-        for msk, sfx, npairs, excl in (( ~diag, "inter", n_inter_pairs, ex_inter),
-                                       (  diag, "intra", n_intra_pairs, ex_intra)):
-            m_ = msk if keep is None else (msk & keep)
-            v = vals[m_]
-            # implicit zeros = all pairs, less those excluded by a zero
-            # denominator, less the observed pairs held explicitly
-            rec.update(_dist_stats_with_zeros(v, npairs - excl - len(v),
-                                              f"{label}_{name}_{sfx}"))
-    return rec
-
-
-def compute_metrics(edges: np.ndarray, community_compact: np.ndarray | None = None) -> dict:
-    n = int(edges.max()) + 1 if len(edges) else 0
-    G = ig.Graph(n=n, directed=True)
-    try:
-        G.add_edges(edges)
-    except TypeError:
-        G.add_edges(edges.tolist())
-
-    in_deg  = np.asarray(G.indegree(),  dtype=np.int32)
-    out_deg = np.asarray(G.outdegree(), dtype=np.int32)
-    tot_deg = in_deg + out_deg
-
-    local_clust = np.asarray(G.transitivity_local_undirected(mode="zero"), dtype=np.float64)
-    coreness    = np.asarray(G.coreness(mode="all"),  dtype=np.int32)
-    pagerank    = np.asarray(G.pagerank(directed=True), dtype=np.float64)
-    knn_vals, _ = G.knn()
-    knn = np.nan_to_num(np.asarray(knn_vals, dtype=np.float64), nan=0.0)
-
-    weak    = G.connected_components(mode="weak")
-    weak_m  = np.asarray(weak.membership)
-    weak_sz = np.bincount(weak_m)
-    is_weak = len(weak_sz) == 1
-    lcc_id  = int(np.argmax(weak_sz))
-    lcc_sz  = int(weak_sz[lcc_id])
-
-    strong    = G.connected_components(mode="strong")
-    strong_sz = np.bincount(strong.membership)
-    is_strong = len(strong_sz) == 1
-
-    rec = {
-        'nodes': n,
-        'edges': G.ecount(),
-        **dist_stats(in_deg, "in_degree"),
-        **dist_stats(out_deg, "out_degree"),
-        **dist_stats(tot_deg, "total_degree"),
-        **dist_stats(np.log1p(in_deg),  "log_in_degree"),
-        **dist_stats(np.log1p(out_deg), "log_out_degree"),
-        **dist_stats(local_clust, "local_clustering"),
-        **dist_stats(coreness,    "coreness"),
-        **dist_stats(pagerank,    "pagerank"),
-        **dist_stats(knn,         "avg_neighbor_degree"),
-        'frac_isolates':          float((tot_deg == 0).mean()) if n else 0.0,
-        'frac_sources':           float((in_deg  == 0).mean()) if n else 0.0,
-        'frac_sinks':             float((out_deg == 0).mean()) if n else 0.0,
-        'frac_degree_1':          float((tot_deg == 1).mean()) if n else 0.0,
-        'global_clustering':      float(G.transitivity_undirected(mode="zero")),
-        # transitivity_avglocal_undirected(mode="zero") is by definition the
-        # mean of transitivity_local_undirected(mode="zero"), already
-        # computed above. Calling it would re-run the triangle enumeration,
-        # whose cost scales with sum(d_i^2) -- the single most expensive
-        # igraph call here on a hub-heavy graph.
-        'avg_local_clustering':   float(local_clust.mean()) if n else 0.0,
-        'reciprocity':            float(G.reciprocity()),
-        'density':                float(G.density()),
-        'max_coreness':           int(coreness.max()) if n else 0,
-        'is_weakly_connected':    is_weak,
-        'is_strongly_connected':  is_strong,
-        'num_weak_components':    int(len(weak_sz)),
-        'num_strong_components':  int(len(strong_sz)),
-        'frac_in_lcc_weak':       lcc_sz / n if n else 0.0,
-        'frac_in_lscc':           int(strong_sz.max()) / n if n else 0.0,
-    }
-
-    if n > 1:
-        sub = G if is_weak else G.induced_subgraph(np.where(weak_m == lcc_id)[0].tolist())
-        start = np.random.randint(sub.vcount())
-        # sub is weakly connected and distances() uses mode="all", so no
-        # entry is actually infinite; the guards below are belt-and-braces.
-        d1 = np.asarray(sub.distances(source=start, mode="all")[0], dtype=np.float64)
-        far1 = int(np.argmax(np.where(np.isfinite(d1), d1, -1.0)))
-        d2 = np.asarray(sub.distances(source=far1, mode="all")[0], dtype=np.float64)
-        finite = d2[np.isfinite(d2)]
-        rec['approx_diameter'] = int(finite.max()) if len(finite) else 0
-    else:
-        rec['approx_diameter'] = 0
-
-    # The array that built G. igraph preserves edge insertion order, so
-    # reading the edgelist back out of G would reconstruct a bit-identical
-    # copy of this at real cost -- just reuse it. Indices stay int32; the
-    # int64 promotion happens inside community_structure_stats only where
-    # the pair code needs it.
-    edges_arr = edges
-
-    if n < BIG:
-        und = G.as_undirected(mode="collapse")
-        part = und.community_label_propagation()
-        rec['modularity']      = float(part.modularity)   # cached on the clustering
-        rec['num_communities'] = len(part)                # O(1), no set over |V|
-
-        # Topology-DETECTED communities -- membership is already in G's own
-        # node-index space (as_undirected() doesn't reorder vertices), so
-        # this needs nothing external: no nodes.parquet, no community_id,
-        # no reindexing. Measures the network's REALIZED structure.
-        detected = np.fromiter(part.membership, dtype=np.int64, count=und.vcount())
-        rec.update(community_structure_stats(G, detected, label="detected_community",
-                                             edges_arr=edges_arr))
-    else:
-        rec['modularity']      = None
-        rec['num_communities'] = None
-
-    # Generative/ASSIGNED communities from asnu's community file, if
-    # available (see load_community_compact) -- measures whether the
-    # network's edges actually respect the community structure it was
-    # generated to have, which can differ from what label propagation
-    # detects above.
-    if community_compact is not None and len(community_compact) == n and n > 0:
-        rec.update(community_structure_stats(G, community_compact, label="assigned_community",
-                                             edges_arr=edges_arr))
-
-    return rec
-
-
-def load_community_compact(net_dir: Path, original_ids: np.ndarray) -> np.ndarray | None:
-    """
-    Read nodes.parquet's community_id column (indexed by ORIGINAL position
-    0..N-1) and reindex it to the compact 0..k-1 space load_edges() uses,
-    via original_ids[i] = original position of compact index i.
-
-    Returns None (with a printed reason) if nodes.parquet doesn't exist,
-    has no community_id column, or any referenced node is missing a
-    community assignment -- callers should just skip community stats in
-    that case rather than compute them on incomplete data.
-    """
-    nodes_path = net_dir / "nodes.parquet"
-    if not nodes_path.exists():
-        print(f"  [{net_dir.name}] no nodes.parquet, skipping community stats")
-        return None
-
-    nodes_df = pd.read_parquet(nodes_path)
-    if "community_id" not in nodes_df.columns:
-        print(f"  [{net_dir.name}] no community_id column, skipping community stats")
-        return None
-
-    community_full = nodes_df["community_id"].to_numpy()
-    if len(original_ids) and original_ids.max() >= len(community_full):
-        print(f"  [{net_dir.name}] original_ids out of range for nodes.parquet "
-              f"({original_ids.max()} >= {len(community_full)}), skipping community stats")
-        return None
-
-    community_compact = community_full[original_ids]
-    if pd.isna(community_compact).any():
-        n_missing = int(pd.isna(community_compact).sum())
-        print(f"  [{net_dir.name}] {n_missing}/{len(community_compact)} nodes missing "
-              f"community_id, skipping community stats")
-        return None
-
-    return community_compact.astype(np.int64)
-
-
-def existing_stats(network_id: str) -> dict:
-    stats_path = data_lake.ROOT / 'networks' / network_id / 'network_stats.parquet'
-    if not stats_path.exists():
-        return {}
-    df = pd.read_parquet(stats_path)
-    return dict(zip(df['stat_name'], df['stat_value']))
-
-
-def is_done(network_id: str) -> bool:
-    """
-    'global_clustering' is only ever written by this stage (never by
-    generation), so its presence means the full metrics stage already ran
-    -- distinct from just having the basic generation-stage stats.
-
-    NOTE: this does NOT distinguish "ran before community_id existed" from
-    "ran with community stats" -- if you want community stats backfilled
-    onto networks processed before that feature existed, you'll need to
-    reprocess them explicitly (delete network_stats.parquet, or add a
-    --force flag) rather than relying on this check.
-    """
-    return 'global_clustering' in existing_stats(network_id)
-
-
-def _write_error(net_dir: Path, message: str) -> None:
-    (net_dir / 'metrics_error.json').write_text(json.dumps({"error": message}))
-    print(f"  [{net_dir.name}] ERROR: {message}")
-
-
-def process_one(network_id: str) -> None:
-    if is_done(network_id):
-        print(f"  [{network_id}] already done, skipping")
-        return
-
-    net_dir = data_lake.network_dir(network_id)
-    npz_path = net_dir / 'edges.npz'
-    if not npz_path.exists():
-        print(f"  [{network_id}] no edges.npz found, skipping")
-        return
-
-    error_path = net_dir / 'metrics_error.json'
-
-    try:
-        edges, original_ids = load_edges(npz_path)
-        if len(edges) == 0:
-            _write_error(net_dir, "no edges")
-            return
-        community_compact = load_community_compact(net_dir, original_ids)
-        rec = compute_metrics(edges, community_compact)
-        del edges
-        gc.collect()
-    except Exception as e:
-        _write_error(net_dir, f"{type(e).__name__}: {e}")
-        return
-
-    # Only numeric fields go into network_stats (float/int/bool -- bool
-    # casts fine via float()). None entries (e.g. modularity skipped on BIG
-    # graphs) are left out rather than coerced. Merge with whatever
-    # generation already wrote (n_nodes, n_edges, gen_time_s) instead of
-    # clobbering it -- write_network_stats() overwrites the whole file.
-    numeric_rec = {k: v for k, v in rec.items() if v is not None}
-    merged = {**existing_stats(network_id), **numeric_rec}
-    data_lake.write_network_stats(network_id, merged)
-
-    if error_path.exists():
-        error_path.unlink()
-
-    print(f"  [{network_id}] DONE: {rec['nodes']} nodes, {rec['edges']} edges", flush=True)
+# Must match ASSORT_DONE_KEY in compute_network_metrics.py
+ASSORT_DONE_KEY = "assortativity_out_in_pearson"
 
 
 def discover_network_ids() -> list[str]:
     net_dir = data_lake.ROOT / 'networks'
     if not net_dir.exists():
         return []
-    return sorted(p.name for p in net_dir.iterdir() if p.is_dir() and (p / 'edges.npz').exists())
+    return sorted(p.name for p in net_dir.iterdir() if p.is_dir() and "ncom" in p.name and (p / 'edges.npz').exists())
+
+
+def _stat_names(network_id: str) -> pd.DataFrame | None:
+    stats_path = data_lake.ROOT / 'networks' / network_id / 'network_stats.parquet'
+    if not stats_path.exists():
+        return None
+    return pd.read_parquet(stats_path)
+
+
+def already_done(network_id: str) -> bool:
+    df = _stat_names(network_id)
+    if df is None:
+        return False
+    if not 'global_clustering' in set(df['stat_name']): return False
+    row = df[df['stat_name'] == 'global_clustering']
+    if row.empty:
+        return False
+    return row['stat_value'].notna().any() 
+
+
+def assortativity_done(network_id: str) -> bool:
+    # Presence only: nan is a legitimate value (constant degrees).
+    df = _stat_names(network_id)
+    return df is not None and ASSORT_DONE_KEY in set(df['stat_name'])
+
+
+def run_task(network_id: str, script: str, python: str, logs_dir: Path,
+             only: str | None = None) -> tuple[str, int]:
+    out_path = logs_dir / f"{network_id}.out"
+    err_path = logs_dir / f"{network_id}.err"
+    cmd = [python, script, "--network_id", network_id]
+    if only:
+        cmd += ["--only", only]
+    with open(out_path, "w") as out_f, open(err_path, "w") as err_f:
+        result = subprocess.run(cmd, stdout=out_f, stderr=err_f, cwd=SCRIPT_DIR)
+    return network_id, result.returncode
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--network_id', type=str, default=None,
-                        help='Specific network_id to process. If omitted, uses --task_id.')
-    parser.add_argument('--task_id', type=int, default=None,
-                        help='Index into sorted list of all network_ids with edges.npz.')
+    parser.add_argument("--max_parallel", type=int, default=5)
+    parser.add_argument("--script", default="compute_network_metrics.py")
+    parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--only", choices=["assortativity"], default=None,
+                        help="Backfill only this group of stats onto networks missing it.")
     args = parser.parse_args()
 
-    if args.network_id:
-        process_one(args.network_id)
+    logs_dir = data_lake.ROOT / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    logs_dir = logs_dir / ("metrics" if args.only is None else f"metrics_{args.only}")
+    logs_dir.mkdir(exist_ok=True)
+
+    all_network_ids = discover_network_ids()
+    if not all_network_ids:
+        print(f"No networks with edges.npz found under {data_lake.ROOT / 'networks'}")
         return
 
-    task_id = args.task_id
-    if task_id is None:
-        slurm_id = os.environ.get('SLURM_ARRAY_TASK_ID')
-        if slurm_id is None:
-            raise RuntimeError("Provide --network_id, --task_id, or set SLURM_ARRAY_TASK_ID")
-        task_id = int(slurm_id)
+    done_check = assortativity_done if args.only == "assortativity" else already_done
+    todo = [nid for nid in all_network_ids if not done_check(nid)]
+    skipped = len(all_network_ids) - len(todo)
 
-    network_ids = discover_network_ids()
-    if task_id >= len(network_ids):
-        print(f"task_id {task_id} out of range ({len(network_ids)} networks). Exiting.")
+    mode = "full metrics" if args.only is None else f"{args.only} only"
+    print(f"Mode: {mode}")
+    print(f"Found {len(all_network_ids)} networks, {skipped} already done, {len(todo)} to process")
+    print(f"Max parallel workers: {args.max_parallel}")
+    print(f"Starting at {datetime.now()}")
+
+    if not todo:
+        print("Nothing to do.")
         return
 
-    process_one(network_ids[task_id])
+    completed = 0
+    failures = []
+
+    with ThreadPoolExecutor(max_workers=args.max_parallel) as pool:
+        futures = {
+            pool.submit(run_task, nid, args.script, args.python, logs_dir, args.only): nid
+            for nid in todo
+        }
+        try:
+            for future in as_completed(futures):
+                network_id, returncode = future.result()
+                completed += 1
+                if returncode != 0:
+                    failures.append(network_id)
+                if completed % 10 == 0 or completed == len(todo):
+                    print(f"Progress: {completed}/{len(todo)} finished at {datetime.now()}")
+        except KeyboardInterrupt:
+            print(f"\nInterrupted after {completed}/{len(todo)} -- "
+                  f"cancelling not-yet-started tasks...")
+            for f in futures:
+                f.cancel()
+            raise
+
+    print(f"\nAll tasks completed at {datetime.now()}")
+    print(f"Skipped (already done): {skipped}")
+    print(f"Results: {completed - len(failures)} ok, {len(failures)} errors out of {completed}")
+    if failures:
+        print(f"Failed network_ids ({len(failures)}): {failures}")
+    print(f"Check logs in {logs_dir} for details")
+
+    if failures:
+        sys.exit(1)
 
 
 if __name__ == '__main__':
