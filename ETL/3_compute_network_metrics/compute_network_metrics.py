@@ -141,11 +141,88 @@ def assortativity_stats(edges: np.ndarray) -> dict:
     return rec
 
 
+def cohesion_stats(edges: np.ndarray, community_compact: np.ndarray,
+                   label: str = "assigned_community") -> dict:
+    """
+    How strongly communities can block a fractional-threshold cascade, for a
+    given community per node (aligned with the compact node indices of
+    `edges`). Exposure follows edge direction (u -> v: u exposes v), so
+    everything is based on each person's IN-ties; people with in-degree 0
+    can never be exposed and are left out.
+
+      {label}_embeddedness_*        distribution over people of the share of
+                                    their in-ties that come from their own
+                                    community (Morris 2000). High values =
+                                    hard to reach from outside.
+      {label}_cohesion_max          per community: the LOWEST embeddedness
+                                    among its members (Morris's cohesion);
+                                    network value = the most cohesive
+                                    community, i.e. the strongest blocking
+                                    group. Only communities with >= 2 members
+                                    in the largest weakly connected component.
+      {label}_cohesion_mean         same per-community cohesion, averaged
+                                    weighted by community size.
+      {label}_frac_with_external_tie  share of people with at least one
+                                    in-tie from another community: how
+                                    widely contact between communities is
+                                    spread over people (bridge width,
+                                    Centola & Macy 2007).
+      {label}_frac_inter_edges      share of all ties that connect two
+                                    different communities.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    n = int(edges.max()) + 1
+    _, memb = np.unique(community_compact, return_inverse=True)
+    src, dst = edges[:, 0], edges[:, 1]
+    internal = memb[src] == memb[dst]
+
+    in_deg = np.bincount(dst, minlength=n)
+    int_in = np.bincount(dst, weights=internal, minlength=n)
+    exposed = in_deg > 0
+    emb = int_in[exposed] / in_deg[exposed]
+
+    rec = dist_stats(emb, f"{label}_embeddedness")
+    rec[f"{label}_frac_with_external_tie"] = float((emb < 1).mean()) if len(emb) else 0.0
+    rec[f"{label}_frac_inter_edges"] = float(1.0 - internal.mean())
+
+    # Community cohesion, restricted to the largest weakly connected component
+    adj = coo_matrix((np.ones(len(src)), (src, dst)), shape=(n, n))
+    _, comp = connected_components(adj, directed=True, connection="weak")
+    in_lcc = comp == np.argmax(np.bincount(comp))
+    keep = exposed & in_lcc
+    k = int(memb.max()) + 1
+    cmin = np.full(k, np.inf)
+    np.minimum.at(cmin, memb[keep], (int_in[keep] / in_deg[keep]))
+    size = np.bincount(memb[keep], minlength=k)
+    ok = size >= 2
+    if ok.any():
+        rec[f"{label}_cohesion_max"] = float(cmin[ok].max())
+        rec[f"{label}_cohesion_mean"] = float(np.average(cmin[ok], weights=size[ok]))
+    else:
+        rec[f"{label}_cohesion_max"] = float("nan")
+        rec[f"{label}_cohesion_mean"] = float("nan")
+    return rec
+
+
+def _cohesion_only(edges, original_ids, net_dir):
+    """--only cohesion: uses the ASSIGNED communities from nodes.parquet, so
+    no community detection is run. Returns {} if they're unavailable."""
+    community_compact = load_community_compact(net_dir, original_ids)
+    if community_compact is None or len(community_compact) != int(edges.max()) + 1:
+        return {}
+    return cohesion_stats(edges, community_compact)
+
+
 # Metrics that can be computed on their own with --only, for networks that
-# already went through the full stage. name -> (function of the edge array,
-# a key whose presence in network_stats means it was already computed).
+# already went through the full stage. name -> (function of
+# (edges, original_ids, net_dir), a key whose presence in network_stats means
+# it was already computed).
 ONLY_METRICS = {
-    "assortativity": (assortativity_stats, "assortativity_out_in_pearson"),
+    "assortativity": (lambda edges, original_ids, net_dir: assortativity_stats(edges),
+                      "assortativity_out_in_pearson"),
+    "cohesion": (_cohesion_only, "assigned_community_cohesion_max"),
 }
 
 
@@ -435,6 +512,7 @@ def compute_metrics(edges: np.ndarray, community_compact: np.ndarray | None = No
     if community_compact is not None and len(community_compact) == n and n > 0:
         rec.update(community_structure_stats(G, community_compact, label="assigned_community",
                                              edges_arr=edges_arr))
+        rec.update(cohesion_stats(edges, community_compact, label="assigned_community"))
 
     return rec
 
@@ -558,11 +636,14 @@ def process_only(network_id: str, metric: str) -> None:
         print(f"  [{network_id}] no edges.npz found, skipping")
         return
 
-    edges, _ = load_edges(npz_path)
+    edges, original_ids = load_edges(npz_path)
     if len(edges) == 0:
         print(f"  [{network_id}] no edges, skipping")
         return
-    rec = func(edges)
+    rec = func(edges, original_ids, npz_path.parent)
+    if not rec:
+        print(f"  [{network_id}] {metric} not available for this network, skipping")
+        return
 
     merged = {**existing_stats(network_id), **rec}
     data_lake.write_network_stats(network_id, merged)
