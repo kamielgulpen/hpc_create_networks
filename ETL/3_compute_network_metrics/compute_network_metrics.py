@@ -215,6 +215,32 @@ def _cohesion_only(edges, original_ids, net_dir):
     return cohesion_stats(edges, community_compact)
 
 
+def _cohesion_detected_only(edges, original_ids, net_dir):
+    """--only cohesion_detected: detects communities with label propagation
+    (same method as the full run, nothing else is computed), saves them to
+    detected_communities.npz so detection never has to be repeated, and
+    computes cohesion_stats on them. Also stores the modularity and number of
+    communities of THIS partition, because label propagation is random and the
+    partition can differ from the one behind the stored 'modularity'.
+    Skipped (like in the full run) for networks with n >= BIG."""
+    import random
+    n = int(edges.max()) + 1
+    if n >= BIG:
+        return {}
+    G = ig.Graph(n=n, edges=edges, directed=True)
+    und = G.as_undirected(mode="collapse")
+    del G
+    random.seed(0)          # igraph's default RNG is Python's random -> reproducible
+    part = und.community_label_propagation()
+    memb = np.fromiter(part.membership, dtype=np.int64, count=n)
+    np.savez_compressed(net_dir / "detected_communities.npz",
+                        original_ids=original_ids, membership=memb)
+    rec = cohesion_stats(edges, memb, label="detected_community")
+    rec["detected_community_modularity"] = float(part.modularity)
+    rec["detected_community_n_communities"] = float(len(part))
+    return rec
+
+
 # Metrics that can be computed on their own with --only, for networks that
 # already went through the full stage. name -> (function of
 # (edges, original_ids, net_dir), a key whose presence in network_stats means
@@ -223,6 +249,7 @@ ONLY_METRICS = {
     "assortativity": (lambda edges, original_ids, net_dir: assortativity_stats(edges),
                       "assortativity_out_in_pearson"),
     "cohesion": (_cohesion_only, "assigned_community_cohesion_max"),
+    "cohesion_detected": (_cohesion_detected_only, "detected_community_cohesion_max"),
 }
 
 
@@ -500,6 +527,7 @@ def compute_metrics(edges: np.ndarray, community_compact: np.ndarray | None = No
         detected = np.fromiter(part.membership, dtype=np.int64, count=und.vcount())
         rec.update(community_structure_stats(G, detected, label="detected_community",
                                              edges_arr=edges_arr))
+        rec.update(cohesion_stats(edges, detected, label="detected_community"))
     else:
         rec['modularity']      = None
         rec['num_communities'] = None
